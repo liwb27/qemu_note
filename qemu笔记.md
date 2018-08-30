@@ -93,7 +93,7 @@ QEMU v0.9.1版本之前动态翻译都是由DynGen完成的。TB被DynGen转换�
 
 动态翻译使得代码再需要时才被转换。这个思想的主要目的是用最多的时间去执行生成后的代码而不是去生成代码(The idea was to spend the maximum time executing the generated code that executing the code generation)。每当从TB转换为代码（应该指的是TCG）后，这些代码会再执行前先被存储起来。多数时候相同的TB会被多次调用，这样通过本地引用（Locality Reference）可以重复使用之前转换好的代码。当指令缓存(code cache)填满时，整个缓存会被清空而不是使用LRU算法（least recently used，缓存淘汰算法）。
 
-![avatar](构架2.png)
+![avatar](构架2.PNG)
 
 在执行前编译器从源代码(source code)中生成结果代码(object code)。为了生成一个函数调用的结果代码，编译器（例如GCC）会在函数调用之前和之后插入一些特殊的汇编码（assembly code），这些汇编码称作函数序曲和尾声(Function Prologue and Epilogue)。
 
@@ -111,19 +111,19 @@ Function Epilogue恢复 function prologue执行的操作，并将控制权交会
 
 TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成的代码存储在缓存(code buffer)中，通过TCG的 Prologue和Epilogue功能来执行code buffer中的代码或者从中跳出（The execution control is passed to and from the code cache through TCG’s very on Prologue and Epilogue）。执行的流程见下图
 
-![avatar](构架3.png)
+![avatar](构架3.PNG)
 
 下面4幅图介绍了TCG是如何工作的：
 
-![avatar](构架4.png)
-![avatar](构架5.png)
-![avatar](构架6.png)
-![avatar](构架7.png)
+![avatar](构架4.PNG)
+![avatar](构架5.PNG)
+![avatar](构架6.PNG)
+![avatar](构架7.PNG)
 
 ## TB链（Chaining of TBs）
 从code cache返回到静态代码（QEMU程序），或者跳转到code cache通常都十分缓慢。为了解决这一问题，QEMU将每一个TB都链接到下一个TB。这样在执行完一个TB后会直接执行下一个TB而不是返回静态代码（QEMU程序）。当不存在链接(no chaining)的TB1执行完返回静态代码后，紧接着发现、转换、执行了TB2，那么当TB2返回时就会被自动的链接到TB1上。这样下次TB1执行完成后就会直接执行TB2，而不返回静态代码。如下图所示。
 
-![avatar](TB_chain.png)
+![avatar](TB_chain.PNG)
 
 ## 执行过程(Execution trace)
 
