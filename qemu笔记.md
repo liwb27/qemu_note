@@ -132,6 +132,12 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
 本节是代码基本构架一节的扩充。
 
 1. main(..){/vl.c}: main函数解析命令行输入参数，本根据参数设置虚拟机(VM)，例如ram，磁盘大小，启动盘等。当VM设置完成后，main()调用main_loop()。
+    qemu_init_cpu_list();
+    qemu_init_cpu_loop();
+
+
+
+
 
 1. main_loop(...){/vl.c}: [Function main_loop initially calls qemu_main_loop_start() and then does infinite looping of cpu_exec_all() and profile_getclock() within a do-while for which the condition is vm_can_run(). The infinite for-loop continues with checking some VM halting situations like qemu_shutdown_requested(), qemu_powerdown_requested(), qemu_vmstop_requested() etc. These halting conditions will not be investigated further.] v3.0已经不是这个结构，
     ``` C
@@ -151,7 +157,7 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
         }
     }
     ```
-    1. ti应该是内部时间，
+    1. ti应该是内部时间
     1. main_loop_should_exit()检查是否退出循环，main_loop_should_exit()中检查了runstate_check(),qemu_debug_requested(),qemu_suspend_requested(),qemu_shutdown_requested(),qemu_kill_report(),qapi_event_send_shutdown()...等信号
     1. profile_getclock{/include/qemu/timer.h}, 和profile计时有关
     1. main_loop_wait(){/include/qemu/main-loop.h,/util/main-loop.c}是循环执行内容的主题(Run one iteration of the main loop)。
@@ -161,19 +167,23 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
             - slirp_pollfds_fill() {slirp/libslirp.h, slirp/slirp.c}
             - qemu_soonest_timeout() {/include/qemu/timer.h} Calculates the soonest of two timeout values. -1 means infinite, which is later than any other value.
                 - timerlistgroup_deadline_ns() {/include/qemu/timer.h} Determine the deadline of the soonest timer to expire associated with any timer list linked to the timer list group. Only clocks suitable for deadline calculation are included.
-            - os_host_main_loop_wait(){/util/main-loop.c} 
+            - os_host_main_loop_wait(){/util/main-loop.c} 根据操作系统不同，有2个函数。
             - slirp_pollfds_poll()
             - qemu_start_warp_timer() {/cpus.c} 
             - qemu_clock_run_all_timers() {/include/qemu/timer.h} Run all the timers associated with the default timer list of every clock.
 
 1. cpu_exec(...){/accel/tcg/cpu-exec.c}主要执行过程，找不到和main_loop()之间是如何调用的
     可能的调用层次
-    qemu_init_vcpu
-        qemu_tcg_init_vcpu 
-            qemu_tcg_cpu_thread_fn 多线程tcg
-            qemu_tcg_rr_cpu_thread_fn 单线程tcg
-                tcg_cpu_exec
-                    cpu_exec 主要执行过程
+    arm_cpu_class_init
+        x86_cpu_realizefn{/target/xxx/cpu.c} 每个target中都有这个函数，具体实现不同
+            cpu_exec_realizefn{/exec.c}
+            qemu_init_vcpu
+                qemu_tcg_init_vcpu 
+                    qemu_tcg_cpu_thread_fn 多线程tcg
+                    qemu_tcg_rr_cpu_thread_fn 单线程tcg
+                        tcg_cpu_exec
+                            cpu_exec 主要执行过程
+
 
     - struct CPUState{/include/qom/cpu.h} cpu_exec()的参数，在{/target/xxx/cpu.h}中还有一个类似
         ``` C
@@ -226,3 +236,26 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
 
 1. struct TranslationBlock{/include/exec/exec-all.h} TB定义
 
+
+1. {/accel/tcg/translate-all.h}  TranslationBlock structure in translate-all.h Translation cache is code gen buffer in exec.c cpu-exec() in cpu-exec.c orchestrates translation and block chaining. 
+2. {/target/xxx/translate.c}: guest ISA speciﬁc code. 
+3. {tcg-*/*/}: host ISA speciﬁc code.
+4. {linux-user/*}: Linux usermode speciﬁc code. 
+7. hw/*: Hardware, including video, audio, and boards.
+
+
+
+
+
+
+
+https://people.cs.nctu.edu.tw/~chenwj/dokuwiki/doku.php?id=qemu
+
+
+# tcg讲解
+https://chemnitzer.linux-tage.de/2012/vortraege/1062
+tcg使用方法
+1. guest--需要模拟的体系机构，target--运行tcg的体系结构。
+1. 直接使用qemu提供的tcg中间函数去构建自己的guest指令，将guest指令转换为tcg执行后再执行
+2. 使用tcg_helper来构建复杂guest指令，tcg在运行时会直接调用对应的helper函数，这样，guest指令直接转换为c代码运行
+3. tcg中间代码微指令类型总结https://blog.csdn.net/lulu901130/article/details/45716883
