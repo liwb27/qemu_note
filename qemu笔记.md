@@ -28,6 +28,16 @@ git clone git://git.qemu-project.org/qemu.git
 sudo apt-get install git libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev
 
 sudo apt-get install libnfs-dev libiscsi-dev
+
+sudo apt-get install git-email
+sudo apt-get install libaio-dev libbluetooth-dev libbrlapi-dev libbz2-dev
+sudo apt-get install libcap-dev libcap-ng-dev libcurl4-gnutls-dev libgtk-3-dev
+sudo apt-get install libibverbs-dev libjpeg8-dev libncurses5-dev libnuma-dev
+sudo apt-get install librbd-dev librdmacm-dev
+sudo apt-get install libsasl2-dev libsdl1.2-dev libseccomp-dev libsnappy-dev libssh2-1-dev
+sudo apt-get install libvde-dev libvdeplug-dev libvte-2.90-dev libxen-dev liblzo2-dev
+sudo apt-get install valgrind xfslibs-dev 
+
 ```
 
 ## 代码编译
@@ -36,13 +46,34 @@ sudo apt-get install libnfs-dev libiscsi-dev
 cd qemu
 mkdir -p build
 cd build
-../configure --target-list=x86_64-softmmu --enable-debug # 只编译x86版本测试，否则超级慢
+../configure --target-list=x86_64-softmmu,arm-softmmu --enable-debug --enable-debug-info # 只编译x86，arm版本
+make
 ```
 编译完成后运行
 ```
 ./build/x86_64-softmmu/qemu-system-x86_64 -L pc-bios
 ```
-console显示`VNC server running on 127.0.0.1:5900`，在浏览器中打开，可以看见运行结果（一行文本）
+如果依赖包安装没有装完全，编译时会没有gtk支持，运行时console显示`VNC server running on 127.0.0.1:5900`，在浏览器中打开，可以看见运行结果（一行文本）。可以运行`./build/x86_64-softmmu/qemu-system-x86_64 -L pc-bios -nographic`来在console中显示。
+如果运行正常，会弹出一个虚拟机界面显示运行情况。
+
+# 使用GDB调试
+运行`gdb --args ./qemu-system-x86_64 -L pc-bios`（--args后面时qemu的运行命令，可以运行其他镜像）。然后可以使用gdb命令进行设置断电例如`break main`，在main函数设置断点。
+
+GDB调试QEMU时经常遇到SIGUSR1与SIGUSR2后停下来，解决办法是执行命令：（网上说的，没遇到过）
+```
+(gdb) handle SIGUSR1 SIGUSR2 noprint nostop
+```
+![avatar](gdb.png)
+## gdb命令
+break 设断点，`break function_name`可以在对应函数设置断点
+c 继续运行
+bt 查看调用堆栈
+layout src 看源码
+info threads 查看线程
+
+## 参考
+https://www.cnblogs.com/woshiweige/p/4518431.html
+https://www.cnblogs.com/shaohef/p/4532437.html
 
 # 代码构架
 主要翻译自qemu detailed study，只有第7章，其他章节没找到。这篇文章应该是基于v0.13.x版本写的，和现有的构架有很多不同
@@ -135,10 +166,6 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
     qemu_init_cpu_list();
     qemu_init_cpu_loop();
 
-
-
-
-
 1. main_loop(...){/vl.c}: [Function main_loop initially calls qemu_main_loop_start() and then does infinite looping of cpu_exec_all() and profile_getclock() within a do-while for which the condition is vm_can_run(). The infinite for-loop continues with checking some VM halting situations like qemu_shutdown_requested(), qemu_powerdown_requested(), qemu_vmstop_requested() etc. These halting conditions will not be investigated further.] v3.0已经不是这个结构，
     ``` C
     static void main_loop(void)
@@ -172,17 +199,65 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
             - qemu_start_warp_timer() {/cpus.c} 
             - qemu_clock_run_all_timers() {/include/qemu/timer.h} Run all the timers associated with the default timer list of every clock.
 
-1. cpu_exec(...){/accel/tcg/cpu-exec.c}主要执行过程，找不到和main_loop()之间是如何调用的
-    可能的调用层次
-    arm_cpu_class_init
-        x86_cpu_realizefn{/target/xxx/cpu.c} 每个target中都有这个函数，具体实现不同
-            cpu_exec_realizefn{/exec.c}
-            qemu_init_vcpu
-                qemu_tcg_init_vcpu 
-                    qemu_tcg_cpu_thread_fn 多线程tcg
-                    qemu_tcg_rr_cpu_thread_fn 单线程tcg
-                        tcg_cpu_exec
-                            cpu_exec 主要执行过程
+1. cpu_exec(...){/accel/tcg/cpu-exec.c}主要执行过程
+
+    qemu_tcg_init_vcpu的调用堆栈，可以看出main函数启动后，在进行一系列初始化的过程中调用了该函数。
+    ```shell
+    #0  0x0000555555850801 in qemu_tcg_init_vcpu (cpu=0x555556b54fc0) at /home/liwb/qemu/cpus.c:1854
+    #1  0x0000555555850df7 in qemu_init_vcpu (cpu=0x555556b54fc0) at /home/liwb/qemu/cpus.c:2007
+    #2  0x000055555594ca35 in x86_cpu_realizefn (dev=0x555556b54fc0, errp=0x7fffffffd780) at /home/liwb/qemu/target/i386/cpu.c:4996
+    #3  0x0000555555a7fd4d in device_set_realized (obj=0x555556b54fc0, value=true, errp=0x7fffffffd958) at /home/liwb/qemu/hw/core/qdev.c:826
+    #4  0x0000555555c6e4d3 in property_set_bool (obj=0x555556b54fc0, v=0x55555699a3a0, name=0x555555ebb4c0 "realized", opaque=0x555556a2ad60, errp=0x7fffffffd958)
+        at /home/liwb/qemu/qom/object.c:1984
+    #5  0x0000555555c6c74f in object_property_set (obj=0x555556b54fc0, v=0x55555699a3a0, name=0x555555ebb4c0 "realized", errp=0x7fffffffd958) at /home/liwb/qemu/qom/object.c:1176
+    #6  0x0000555555c6f810 in object_property_set_qobject (obj=0x555556b54fc0, value=0x5555569ea9e0, name=0x555555ebb4c0 "realized", errp=0x7fffffffd958)
+        at /home/liwb/qemu/qom/qom-qobject.c:27
+    #7  0x0000555555c6ca34 in object_property_set_bool (obj=0x555556b54fc0, value=true, name=0x555555ebb4c0 "realized", errp=0x7fffffffd958) at /home/liwb/qemu/qom/object.c:1242
+    #8  0x0000555555916215 in pc_new_cpu (typename=0x555555ebbe6c "qemu64-x86_64-cpu", apic_id=0, errp=0x5555567680d8 <error_fatal>) at /home/liwb/qemu/hw/i386/pc.c:1107
+    #9  0x0000555555916480 in pc_cpus_init (pcms=0x555556870950) at /home/liwb/qemu/hw/i386/pc.c:1155
+    #10 0x000055555591aa50 in pc_init1 (machine=0x555556870950, host_type=0x555555ebc844 "i440FX-pcihost", pci_type=0x555555ebc83d "i440FX")
+        at /home/liwb/qemu/hw/i386/pc_piix.c:153
+    #11 0x000055555591b659 in pc_init_v3_0 (machine=0x555556870950) at /home/liwb/qemu/hw/i386/pc_piix.c:438
+    #12 0x0000555555a882fc in machine_run_board_init (machine=0x555556870950) at /home/liwb/qemu/hw/core/machine.c:830
+    #13 0x00005555559d5aa4 in main (argc=3, argv=0x7fffffffde48, envp=0x7fffffffde68) at /home/liwb/qemu/vl.c:4516
+    ```
+
+    观察qemu_tcg_init_vcpu函数的代码，可以找到如下段落：
+    ```C++
+    if (qemu_tcg_mttcg_enabled()) {
+        /* create a thread per vCPU with TCG (MTTCG) */
+        parallel_cpus = true;
+        snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "CPU %d/TCG",
+                cpu->cpu_index);
+
+        qemu_thread_create(cpu->thread, thread_name, qemu_tcg_cpu_thread_fn,
+                            cpu, QEMU_THREAD_JOINABLE);
+
+    } else {
+        /* share a single thread for all cpus with TCG */
+        snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "ALL CPUs/TCG");
+        qemu_thread_create(cpu->thread, thread_name,
+                            qemu_tcg_rr_cpu_thread_fn,
+                            cpu, QEMU_THREAD_JOINABLE);
+
+        single_tcg_halt_cond = cpu->halt_cond;
+        single_tcg_cpu_thread = cpu->thread;
+    }
+    ```
+    这些代码根据模式不同使用了单线程或者多线程tcg。然后通过qemu_thread_create函数创建了tcg的运行线程。
+
+    然后观察cpu_exec的调用堆栈，可以推测出cpu_exec和qemu_tcg_rr_cpu_thread_fn运行同一个线程中，这个线程应该就是在qemu_tcg_init_vcpu中创建的。
+    ```shell
+    Thread 6 "qemu-system-x86" hit Breakpoint 4, cpu_exec (cpu=0x555556b537c0) at /home/liwb/qemu/accel/tcg/cpu-exec.c:656
+    (gdb) bt
+    #0  0x00005555558aab2c in cpu_exec (cpu=0x555556b537c0) at /home/liwb/qemu/accel/tcg/cpu-exec.c:656
+    #1  0x000055555584fbb6 in tcg_cpu_exec (cpu=0x555556b537c0) at /home/liwb/qemu/cpus.c:1363
+    #2  0x000055555584fe0c in qemu_tcg_rr_cpu_thread_fn (arg=0x555556b537c0) at /home/liwb/qemu/cpus.c:1463
+    #3  0x0000555555dac9b7 in qemu_thread_start (args=0x555556a73fe0) at /home/liwb/qemu/util/qemu-thread-posix.c:504
+    #4  0x00007ffff25166db in start_thread (arg=0x7fffc89d6700) at pthread_create.c:463
+    #5  0x00007ffff223f88f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+    ```
+
 
 
     - struct CPUState{/include/qom/cpu.h} cpu_exec()的参数，在{/target/xxx/cpu.h}中还有一个类似
@@ -199,36 +274,35 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
         } CPUMoxieState;
         ```
         的结构体，好像是各个CPU的单独实现
-    - v0.13的代码解析：Function cpu_exec is referred to as the ‘main execution loop’. Here for the first time a translation Block TB is initialized (TranslationBlock *tb) the code then basically continues with handling exceptions. Deep within two nested infinite for-loops one can find tb_find_fast() and tcg_qemu_tb_exec(). tb_find_fast() initiates the search for the next TB for the Guest and then generate the Host code. The generated Host code is then executed through tcg_qemu_tb_exec().
 
     - 和v0.13类似，处理中断还有其他，然后到
         ``` C
-            while (!cpu_handle_exception(cpu, &ret)) {
-                TranslationBlock *last_tb = NULL;
-                int tb_exit = 0;
+        while (!cpu_handle_exception(cpu, &ret)) {
+            TranslationBlock *last_tb = NULL;
+            int tb_exit = 0;
 
-                while (!cpu_handle_interrupt(cpu, &last_tb)) {
-                    uint32_t cflags = cpu->cflags_next_tb;
-                    TranslationBlock *tb;
+            while (!cpu_handle_interrupt(cpu, &last_tb)) {
+                uint32_t cflags = cpu->cflags_next_tb;
+                TranslationBlock *tb;
 
-                    /* When requested, use an exact setting for cflags for the next
-                    execution.  This is used for icount, precise smc, and stop-
-                    after-access watchpoints.  Since this request should never
-                    have CF_INVALID set, -1 is a convenient invalid value that
-                    does not require tcg headers for cpu_common_reset.  */
-                    if (cflags == -1) {
-                        cflags = curr_cflags();
-                    } else {
-                        cpu->cflags_next_tb = -1;
-                    }
-
-                    tb = tb_find(cpu, last_tb, tb_exit, cflags);
-                    cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
-                    /* Try to align the host and virtual clocks
-                    if the guest is in advance */
-                    align_clocks(&sc, cpu);
+                /* When requested, use an exact setting for cflags for the next
+                execution.  This is used for icount, precise smc, and stop-
+                after-access watchpoints.  Since this request should never
+                have CF_INVALID set, -1 is a convenient invalid value that
+                does not require tcg headers for cpu_common_reset.  */
+                if (cflags == -1) {
+                    cflags = curr_cflags();
+                } else {
+                    cpu->cflags_next_tb = -1;
                 }
+
+                tb = tb_find(cpu, last_tb, tb_exit, cflags);
+                cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
+                /* Try to align the host and virtual clocks
+                if the guest is in advance */
+                align_clocks(&sc, cpu);
             }
+        }
         ```
         这里开始处理TB
         - tb_find()
