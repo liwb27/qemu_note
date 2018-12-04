@@ -1,14 +1,16 @@
 需要解决的问题：
-1. 如何在qemu中添加一个新的guest构架：在/target/下新建转换为tcg的代码
-    a. 如何让qemu加载添加的新构架
-    b. 如何配置configure，可以正确的编译新增代码
-1. 如何使用qemu模拟执行guest代码
+1. 如何使用qemu模拟执行guest代码 ✔
+1. 如何在已有target构架基础上，修改出自己需要的新构架
+    - 如何在qemu中添加一个新的target构架：在/target/下新建转换为tcg的代码
+        - 如何让qemu加载添加的新构架
+        - 如何配置configure，可以正确的编译新增代码
 
-
-
+下步工作：
+1. gen_intermediate_code函数分析
+1. 重新调整文档格式
+        
 # 编译安装
 linux安装指导：https://wiki.qemu.org/Hosts/Linux
-
 ## 代码下载
 下载页面：https://www.qemu.org/download/
 
@@ -55,6 +57,15 @@ make
 ```
 如果依赖包安装没有装完全，编译时会没有gtk支持，运行时console显示`VNC server running on 127.0.0.1:5900`，在浏览器中打开，可以看见运行结果（一行文本）。可以运行`./build/x86_64-softmmu/qemu-system-x86_64 -L pc-bios -nographic`来在console中显示。
 如果运行正常，会弹出一个虚拟机界面显示运行情况。
+
+如果编译时指定了多个target，那么编译完成后，在build目录下会有以每个target-name命名的文件夹，这个文件夹中有一个qemu-system-{target-name}的文件，就是qemu针对不同target的执行程序。
+在build目录下还会有几个qemu的通用工具：
+* qemu-img：创建磁盘镜像，创建出的镜像格式有[qcow](https://people.gnome.org/~markmc/qcow-image-format.html)、raw等等
+* qemu-ga：这是一个不利用网络实现 guest 和 host 之间交互的应用程序（使用 virtio-serial），运行在 guest 中。
+* qemu-io：这是一个执行 Qemu I/O 操作的命令行工具。
+* qemu-nbd：磁盘挂载工具。
+
+
 
 # 使用GDB调试
 运行`gdb --args ./qemu-system-x86_64 -L pc-bios`（--args后面时qemu的运行命令，可以运行其他镜像）。然后可以使用gdb命令进行设置断电例如`break main`，在main函数设置断点。
@@ -200,7 +211,7 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
             - qemu_clock_run_all_timers() {/include/qemu/timer.h} Run all the timers associated with the default timer list of every clock.
 
 1. cpu_exec(...){/accel/tcg/cpu-exec.c}主要执行过程
-
+    - 调用关系
     qemu_tcg_init_vcpu的调用堆栈，可以看出main函数启动后，在进行一系列初始化的过程中调用了该函数。
     ```shell
     #0  0x0000555555850801 in qemu_tcg_init_vcpu (cpu=0x555556b54fc0) at /home/liwb/qemu/cpus.c:1854
@@ -258,57 +269,87 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
     #5  0x00007ffff223f88f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
     ```
 
+    - 输入参数
 
+    cpu_exec的输入参数时`CPUState`，定义在{/include/qom/cpu.h}中
 
-    - struct CPUState{/include/qom/cpu.h} cpu_exec()的参数，在{/target/xxx/cpu.h}中还有一个类似
-        ``` C
-        typedef struct MoxieCPU {
-            /*< private >*/
-            CPUState parent_obj;
-            /*< public >*/
+    ``` C
+    typedef struct MoxieCPU {
+        /*< private >*/
+        CPUState parent_obj;
+        /*< public >*/
 
-            CPUMoxieState env;
-        } MoxieCPU;
-        typedef struct CPUMoxieState {
-            //...
-        } CPUMoxieState;
-        ```
-        的结构体，好像是各个CPU的单独实现
+        CPUMoxieState env;
+    } MoxieCPU;
+    typedef struct CPUMoxieState {
+        //...
+    } CPUMoxieState;
+    ```
+    在{/target/xxx/cpu.h}中还有一个类似的结构体，好像是各个CPU的单独实现
 
-    - 和v0.13类似，处理中断还有其他，然后到
-        ``` C
-        while (!cpu_handle_exception(cpu, &ret)) {
-            TranslationBlock *last_tb = NULL;
-            int tb_exit = 0;
+    - 主要调用函数`tb_find`
 
-            while (!cpu_handle_interrupt(cpu, &last_tb)) {
-                uint32_t cflags = cpu->cflags_next_tb;
-                TranslationBlock *tb;
+        主要功能：查找下一个tb，并生成host代码。主要调用函数
+        - tb_lookup__cpu_state{/include/exec/tb_lookup.h} 
+            调用cpu_get_tb_cpu_state，根据cpu不同，执行不同函数，获取当前cpu的PC, BP, Flags等等。（BP是什么？）
+            ``` C
+            cpu_get_tb_cpu_state(env, pc, cs_base, flags);
+            ```
+            然后根据pc值找到对应的tb
 
-                /* When requested, use an exact setting for cflags for the next
-                execution.  This is used for icount, precise smc, and stop-
-                after-access watchpoints.  Since this request should never
-                have CF_INVALID set, -1 is a convenient invalid value that
-                does not require tcg headers for cpu_common_reset.  */
-                if (cflags == -1) {
-                    cflags = curr_cflags();
-                } else {
-                    cpu->cflags_next_tb = -1;
-                }
-
-                tb = tb_find(cpu, last_tb, tb_exit, cflags);
-                cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit);
-                /* Try to align the host and virtual clocks
-                if the guest is in advance */
-                align_clocks(&sc, cpu);
+            ``` C
+            hash = tb_jmp_cache_hash_func(*pc);
+            tb = atomic_rcu_read(&cpu->tb_jmp_cache[hash]);
+            ```
+            `tb_jmp_cache_hash_func`是通过pc值从hash表中找到索引的函数。(This is a hash function to find offset of TB in tb_jmp_cache using the PC as key)
+            当一个tb存储在tb_jmp_cache中时，可以直接通过通过pc值从hash表中找到，然后代码会检查找到的tb的有效性(The code then follows to check the validity of the found TB)？
+            ``` C
+            if (likely(tb &&
+                    tb->pc == *pc &&
+                    tb->cs_base == *cs_base &&
+                    tb->flags == *flags &&
+                    tb->trace_vcpu_dstate == *cpu->trace_dstate &&
+                    (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == cf_mask)) {
+                return tb;
             }
-        }
-        ```
-        这里开始处理TB
-        - tb_find()
-        - cpu_loop_exec_tb()
+            ```
+            如果找到的tb是无效的，则会进行一个速度更慢的查找
+            ``` C
+            tb = tb_htable_lookup(cpu, *pc, *cs_base, *flags, cf_mask);
+            ```
+
+        - tb_gen_code{/accel/tcg/translate_all.c} 生成host代码
+            通过`tb_alloc()`分配一个新tb，这个tb的pc值通过`get_page_addr_code()`函数从cpustate中得到。
+            ``` C
+                phys_pc = get_page_addr_code(env, pc);
+                // ...
+                tb = tb_alloc(pc);
+                // ...
+                tcg_func_start(tcg_ctx);
+
+                tcg_ctx->cpu = ENV_GET_CPU(env);
+                gen_intermediate_code(cpu, tb);
+                tcg_ctx->cpu = NULL;
+            ```
+
+            tcg_func_start() {/tcg/tcg.c}，为tcg_ctx分配了内存，还有些初始化操作，其他功能未知。
+
+            gen_intermediate_code()，应该是转换guest->tcg代码。`//todo: 下面要详细看这部分`
+                调用translator_loop()
+
+            之后会调用tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
+            
+            
+
+    - 主要调用函数`cpu_loop_exec_tb`
+
+    执行tb生成的host代码，主要调用的函数
+        - cpu_tb_exec
+        - cpu_exec_nocache
+
 
 1. struct TranslationBlock{/include/exec/exec-all.h} TB定义
+Structure TranslationBlock contains the following; PC, CS_BASE, Flags corresponding to this TB, tc_ptr (a pointer to the translated code of this TB), tb_next_offset[2], tb_jmp_offset[2] (both to find the TBs chained to this TB. ie. the TB that follows this TB), *jmp_next[2], *jmp_first (points to the TBs that jump into this TB). 
 
 
 1. {/accel/tcg/translate-all.h}  TranslationBlock structure in translate-all.h Translation cache is code gen buffer in exec.c cpu-exec() in cpu-exec.c orchestrates translation and block chaining. 
@@ -316,11 +357,6 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
 3. {tcg-*/*/}: host ISA speciﬁc code.
 4. {linux-user/*}: Linux usermode speciﬁc code. 
 7. hw/*: Hardware, including video, audio, and boards.
-
-
-
-
-
 
 
 https://people.cs.nctu.edu.tw/~chenwj/dokuwiki/doku.php?id=qemu
