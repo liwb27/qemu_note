@@ -173,28 +173,30 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
 
 本节是代码基本构架一节的扩充。
 
-1. main(..){/vl.c}: main函数解析命令行输入参数，本根据参数设置虚拟机(VM)，例如ram，磁盘大小，启动盘等。当VM设置完成后，main()调用main_loop()。
-    qemu_init_cpu_list();
-    qemu_init_cpu_loop();
+### main(..){/vl.c}
+main函数解析命令行输入参数，本根据参数设置虚拟机(VM)，例如ram，磁盘大小，启动盘等。当VM设置完成后，main()调用main_loop()。
+qemu_init_cpu_list();
+qemu_init_cpu_loop();
 
-1. main_loop(...){/vl.c}: [Function main_loop initially calls qemu_main_loop_start() and then does infinite looping of cpu_exec_all() and profile_getclock() within a do-while for which the condition is vm_can_run(). The infinite for-loop continues with checking some VM halting situations like qemu_shutdown_requested(), qemu_powerdown_requested(), qemu_vmstop_requested() etc. These halting conditions will not be investigated further.] v3.0已经不是这个结构，
-    ``` C
-    static void main_loop(void)
-    {
-    #ifdef CONFIG_PROFILER
-        int64_t ti;
-    #endif
-        while (!main_loop_should_exit()) {
-    #ifdef CONFIG_PROFILER
-            ti = profile_getclock();
-    #endif
-            main_loop_wait(false);
-    #ifdef CONFIG_PROFILER
-            dev_time += profile_getclock() - ti;
-    #endif
-        }
+### main_loop(...){/vl.c}
+[Function main_loop initially calls qemu_main_loop_start() and then does infinite looping of cpu_exec_all() and profile_getclock() within a do-while for which the condition is vm_can_run(). The infinite for-loop continues with checking some VM halting situations like qemu_shutdown_requested(), qemu_powerdown_requested(), qemu_vmstop_requested() etc. These halting conditions will not be investigated further.] v3.0已经不是这个结构，
+``` C
+static void main_loop(void)
+{
+#ifdef CONFIG_PROFILER
+    int64_t ti;
+#endif
+    while (!main_loop_should_exit()) {
+#ifdef CONFIG_PROFILER
+        ti = profile_getclock();
+#endif
+        main_loop_wait(false);
+#ifdef CONFIG_PROFILER
+        dev_time += profile_getclock() - ti;
+#endif
     }
-    ```
+}
+```
     1. ti应该是内部时间
     1. main_loop_should_exit()检查是否退出循环，main_loop_should_exit()中检查了runstate_check(),qemu_debug_requested(),qemu_suspend_requested(),qemu_shutdown_requested(),qemu_kill_report(),qapi_event_send_shutdown()...等信号
     1. profile_getclock{/include/qemu/timer.h}, 和profile计时有关
@@ -210,9 +212,13 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
             - qemu_start_warp_timer() {/cpus.c} 
             - qemu_clock_run_all_timers() {/include/qemu/timer.h} Run all the timers associated with the default timer list of every clock.
 
-1. cpu_exec(...){/accel/tcg/cpu-exec.c}主要执行过程
-    - 调用关系
+### cpu_exec(...){/accel/tcg/cpu-exec.c}
+主要执行过程
+
+- 调用关系
+
     qemu_tcg_init_vcpu的调用堆栈，可以看出main函数启动后，在进行一系列初始化的过程中调用了该函数。
+
     ```shell
     #0  0x0000555555850801 in qemu_tcg_init_vcpu (cpu=0x555556b54fc0) at /home/liwb/qemu/cpus.c:1854
     #1  0x0000555555850df7 in qemu_init_vcpu (cpu=0x555556b54fc0) at /home/liwb/qemu/cpus.c:2007
@@ -234,6 +240,7 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
     ```
 
     观察qemu_tcg_init_vcpu函数的代码，可以找到如下段落：
+
     ```C++
     if (qemu_tcg_mttcg_enabled()) {
         /* create a thread per vCPU with TCG (MTTCG) */
@@ -258,6 +265,7 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
     这些代码根据模式不同使用了单线程或者多线程tcg。然后通过qemu_thread_create函数创建了tcg的运行线程。
 
     然后观察cpu_exec的调用堆栈，可以推测出cpu_exec和qemu_tcg_rr_cpu_thread_fn运行同一个线程中，这个线程应该就是在qemu_tcg_init_vcpu中创建的。
+    
     ```shell
     Thread 6 "qemu-system-x86" hit Breakpoint 4, cpu_exec (cpu=0x555556b537c0) at /home/liwb/qemu/accel/tcg/cpu-exec.c:656
     (gdb) bt
@@ -269,7 +277,7 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
     #5  0x00007ffff223f88f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
     ```
 
-    - 输入参数
+- 输入参数
 
     cpu_exec的输入参数时`CPUState`，定义在{/include/qom/cpu.h}中
 
@@ -332,12 +340,142 @@ TCG可以被看作一个事实生成结果代码的编译器。通过TCG生成�
                 tcg_ctx->cpu = NULL;
             ```
 
-            tcg_func_start() {/tcg/tcg.c}，为tcg_ctx分配了内存，还有些初始化操作，其他功能未知。
+            - tcg_func_start() {/tcg/tcg.c}，为tcg_ctx分配了内存，还有些初始化操作，其他功能未知。
 
-            gen_intermediate_code()，应该是转换guest->tcg代码。`//todo: 下面要详细看这部分`
-                调用translator_loop()
+            - gen_intermediate_code(){/target/xxx/translate.c}，应该是转换guest->tcg代码。每个target下均有该函数，将target代码转换为tcg代码（generate intermediate code for basic block 'tb'）
+            
+                该函数会首先生成好一个ops，是下面结构体的实例：
+                
+                TranslatorOps{/accel/tcg/translater.h}结构定义如下。`Disas`应该是disassembly的缩写。
+                ``` C
+                /**
+                * TranslatorOps:
+                * @init_disas_context:
+                *      Initialize the target-specific portions of DisasContext struct.
+                *      The generic DisasContextBase has already been initialized.
+                *
+                * @tb_start:
+                *      Emit any code required before the start of the main loop,
+                *      after the generic gen_tb_start().
+                *
+                * @insn_start:
+                *      Emit the tcg_gen_insn_start opcode.
+                *
+                * @breakpoint_check:
+                *      When called, the breakpoint has already been checked to match the PC,
+                *      but the target may decide the breakpoint missed the address
+                *      (e.g., due to conditions encoded in their flags).  Return true to
+                *      indicate that the breakpoint did hit, in which case no more breakpoints
+                *      are checked.  If the breakpoint did hit, emit any code required to
+                *      signal the exception, and set db->is_jmp as necessary to terminate
+                *      the main loop.
+                *
+                * @translate_insn:
+                *      Disassemble one instruction and set db->pc_next for the start
+                *      of the following instruction.  Set db->is_jmp as necessary to
+                *      terminate the main loop.
+                *
+                * @tb_stop:
+                *      Emit any opcodes required to exit the TB, based on db->is_jmp.
+                *
+                * @disas_log:
+                *      Print instruction disassembly to log.
+                */
+                typedef struct TranslatorOps {
+                    void (*init_disas_context)(DisasContextBase *db, CPUState *cpu);
+                    void (*tb_start)(DisasContextBase *db, CPUState *cpu);
+                    void (*insn_start)(DisasContextBase *db, CPUState *cpu);
+                    bool (*breakpoint_check)(DisasContextBase *db, CPUState *cpu,
+                                            const CPUBreakpoint *bp);
+                    void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
+                    void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
+                    void (*disas_log)(const DisasContextBase *db, CPUState *cpu);
+                } TranslatorOps;
 
-            之后会调用tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
+                /**
+                * DisasContextBase:
+                * @tb: Translation block for this disassembly.
+                * @pc_first: Address of first guest instruction in this TB.
+                * @pc_next: Address of next guest instruction in this TB (current during
+                *           disassembly).
+                * @is_jmp: What instruction to disassemble next.
+                * @num_insns: Number of translated instructions (including current).
+                * @max_insns: Maximum number of instructions to be translated in this TB.
+                * @singlestep_enabled: "Hardware" single stepping enabled.
+                *
+                * Architecture-agnostic disassembly context.
+                */
+                typedef struct DisasContextBase {
+                    TranslationBlock *tb;
+                    target_ulong pc_first;
+                    target_ulong pc_next;
+                    DisasJumpType is_jmp;
+                    int num_insns;
+                    int max_insns;
+                    bool singlestep_enabled;
+                } DisasContextBase;
+                ```
+                这个结构体中存的都是函数指针，在每个target/translate.c文件中都会对这个结构体进行实例化，结构体中每个成员函数就是对应的功能入口，均在同一个文件中。
+                ``` C
+                static const TranslatorOps arm_translator_ops = {
+                    .init_disas_context = arm_tr_init_disas_context,
+                    .tb_start           = arm_tr_tb_start,
+                    .insn_start         = arm_tr_insn_start,
+                    .breakpoint_check   = arm_tr_breakpoint_check,
+                    .translate_insn     = arm_tr_translate_insn,
+                    .tb_stop            = arm_tr_tb_stop,
+                    .disas_log          = arm_tr_disas_log,
+                };
+                ```
+
+                定义好ops后，会调用translator_loop()函数来实现target->tcg代码的转换。
+
+                translator_loop() {accel/tcg/translator.c,accel/tcg/translator.h}
+                ``` C
+                /**
+                * translator_loop:
+                * @ops: Target-specific operations.
+                * @db: Disassembly context.
+                * @cpu: Target vCPU.
+                * @tb: Translation block.
+                *
+                * Generic translator loop.
+                *
+                * Translation will stop in the following cases (in order):
+                * - When is_jmp set by #TranslatorOps::breakpoint_check.
+                *   - set to DISAS_TOO_MANY exits after translating one more insn
+                *   - set to any other value than DISAS_NEXT exits immediately.
+                * - When is_jmp set by #TranslatorOps::translate_insn.
+                *   - set to any value other than DISAS_NEXT exits immediately.
+                * - When the TCG operation buffer is full.
+                * - When single-stepping is enabled (system-wide or on the current vCPU).
+                * - When too many instructions have been translated.
+                */
+                void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
+                                    CPUState *cpu, TranslationBlock *tb);
+                ```
+                
+                查看了几个target下的translator_loop函数调用，发现第二个参数db均是在gen_intermediate_code()中定义的一个空结构体。这个变量在translator_loop首先会被初始化，按照函数注释，这个变量中存储的是反汇编内容，应该指的是转换后的tcg码。但是db并没有作为返回值，应该会在函数结束后消亡，应该在translator_loop中子函数中保存了它，还需要进一步观察。
+
+                translator_loop函数结构比较简单，流程如下：
+                1. 初始化`DisasContext`
+                1. `Instruction counting` 给db->max_insns变量赋值，这个tb中的将要译码的最大指令数量
+                1. ops->init_disas_context(db, cpu)。 ops成员函数，对每个target会使用对应的函数。Initialize the target-specific portions of DisasContext struct. The generic DisasContextBase has already been initialized. 前面初始化的是DisasContext的公共部分，这里是对每个target调用专有的初始化函数。
+                1. tcg_clear_temp_count()。 /* Reset the temp count so that we can identify leaks */
+                1. gen_tb_start(db->tb){/exec/gen-icount.h}。这个文件中有好几个类似函数，文件注释是/* Helpers for instruction counting code generation.  */，应该是在执行过程中的辅助函数，程序计数用？
+                1. ops->tb_start(db, cpu)。ops成员函数，Emit any code required before the start of the main loop，after the generic gen_tb_start().没理解注释含义，待后续查看函数内容再说。
+                1. while循环开始，逐条开始译码。
+
+                    1. 程序计数加一，调用ops->insn_start(db, cpu)
+                    1. 检查调试断点，如果下一条指令是断点，调用ops->breakpoint_check(db, cpu, bp)，并结束while
+                    1. 调用ops->translate_insn(db, cpu)进行译码，有一个当前指令书等于最大指令数的特殊判断，不清楚具体作用
+                    1. 结束循环判断。一是db->is_jmp不是译码下一条指令`DISAS_NEXT`，二是tcg_op_buf_full() 或者 db->num_insns >= db->max_insns，指令数超上限
+                1. ops->tb_stop(db, cpu)。 Emit any opcodes required to exit the TB, based on db->is_jmp.
+                1. gen_tb_end(db->tb, db->num_insns);？？
+
+                todo：ops中各函数的详细分析
+
+        - tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
             
             
 
