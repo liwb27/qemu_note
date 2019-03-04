@@ -173,7 +173,7 @@ TCG可以被看作一个生成object code的编译器。通过TCG生成的代码
 qemu基本的执行流程可以参加下图，图中最上部分表格表示所对应的文件位置，绿色方框代表函数，浅蓝色方框代表执行流程，红色连接线代表尚未完全清楚的调用关系，蓝色连接线代表程序执行流程，绿色虚线代表将函数执行的过程展开描述。
 ![avatar](执行流程.svg)
 
-### main(..){/vl.c}
+### main `{/vl.c}`
 main函数解析命令行输入参数，本根据参数设置虚拟机(VM)，例如ram，磁盘大小，启动盘等。当VM设置完成后，main()调用main_loop()。
 qemu_init_cpu_list();
 qemu_init_cpu_loop();
@@ -215,7 +215,7 @@ Thread 6 "qemu-system-x86" hit Breakpoint 4, cpu_exec (cpu=0x555556b537c0) at /h
 ```
 
 
-### main_loop(...){/vl.c}
+### main_loop `{/vl.c}`
 [Function main_loop initially calls qemu_main_loop_start() and then does infinite looping of cpu_exec_all() and profile_getclock() within a do-while for which the condition is vm_can_run(). The infinite for-loop continues with checking some VM halting situations like qemu_shutdown_requested(), qemu_powerdown_requested(), qemu_vmstop_requested() etc. These halting conditions will not be investigated further.] 
 
 上文是早期版本的函数解释，v3.0已经不是这个结构，代码如下：
@@ -254,21 +254,33 @@ static void main_loop(void)
 
 并不清楚在main_loop_wait中具体的作用。
 
-### xxx_cpu_realizefn() {/target/xxx/cpu.c}
-
-> todo: 修改执行流程图中的函数流程
+### xxx_cpu_realizefn() `{/target/xxx/cpu.c}`
 
 每个target下都有这个函数，具体内容各不相同，但都先后效用了下面两个函数
 1. cpu_exec_realizefn 猜测应该是cpu实例化的函数
 1. qemu_init_vcpu 初始化vcpu，vcpu是虚拟cpu？cpu指的是target的cpu，那么vcpu是指运行在实体机上的cpu被用来执行tcg指令的？
 1. cpu_reset cpu重置
 
-### cpu_exec_realizefn() {/exec.c}
+### cpu_exec_realizefn() `{/exec.c}`
+1. cpu_list_add(cpu); {/cpu-commons.c} 将当前cpu添加到cpulist， 给cpu->cpu_index = cpu_get_free_index()赋值了一个新的序号
+1. if (tcg_enabled() && !tcg_target_initialized)  
+    * {/qemo-common.h}中的一个宏定义，如果启用了tcg则`#define tcg_enabled() (tcg_allowed)`
+    * tcg_allowed是一个全局变量，在tcg_exec_init{/accel/tcg/translate-all.c}中赋值为true，该函数在main()中被调用。
+1. cc->tcg_initialize(); 
+    * cc是CPUClass{/include/qom/cpu.h}类型，详情可以参见其中注释
+    * tcg_initialize是一个虚函数，在不同的target中被赋值为不同的函数。
+    * 在openrisc中的tcg_initialize是openrisc_translate_init{/target/openrisc/translate.c}，函数中定义了许多TCGv类型的全局变量，应该是供tcg调用的
+    * TCGv{/tcg/tcg.h}类型，根据系统不同为32或者64位integer
+        > Note that there is no definition of the structs TCGv_i32_d etc anywhere. This is deliberate, because the values we store in variables of type TCGv_i32 are not really pointers-to-structures. They're just small integers, but keeping them in pointer types like this means that the compiler will complain if you accidentally pass a TCGv_i32 to a  function which takes a TCGv_i64, and so on. Only the internals of TCG need to care about the actual contents of the types.
 
+### qemu_init_vcpu() `{/cpus.c}`
+1. CPUState *cpu, CPUState{/include/qom/cpu.h}是`State of one CPU core or thread.`
+1. cpu->as 到第一个AddressSpace的指针，`Pointer to the first AddressSpace, for the convenience of targets which only have a single AddressSpace`
+1. if (!cpu->as) {...} 如果没有AddressSpace，那么将cpu的AddressSpace数设为1，然后新建一个AddressSpace。
+1. 根据kvm_enabled、hax_enabled、hvf_enabled、tcg_enabled、whpx_enabled选择init方式，这里调用了qemu_tcg_init_vcpu()
+1. while (!cpu->created) {...qemu_cond_wait...} 等待直到cpu->created
 
-### qemu_init_vcpu() {/cpus.c}
-
-### qemu_tcg_init_vcpu {/cpus.c}
+### qemu_tcg_init_vcpu `{/cpus.c}`
 观察qemu_tcg_init_vcpu函数的代码，可以找到如下段落：
 
 ```C++
@@ -294,252 +306,467 @@ if (qemu_tcg_mttcg_enabled()) {
 ```
 这些代码根据模式不同使用了单线程或者多线程tcg。然后通过qemu_thread_create函数创建了tcg的运行线程。
 
-
-
-### qemu_tcg_rr_cpu_thread_fn {/cpus.c}
-
-### tcg_cpu_exec {/cpus.c}
-
-### cpu_exec(...) {/accel/tcg/cpu-exec.c}
-主要执行过程
-
-
-- 输入参数
-
-    cpu_exec的输入参数时`CPUState`，定义在{/include/qom/cpu.h}中
-
-    ``` C
-    typedef struct MoxieCPU {
-        /*< private >*/
-        CPUState parent_obj;
-        /*< public >*/
-
-        CPUMoxieState env;
-    } MoxieCPU;
-    typedef struct CPUMoxieState {
-        //...
-    } CPUMoxieState;
+### qemu_tcg_rr_cpu_thread_fn `{/cpus.c}`
+1. 函数注释
+    ```C
+    /* Single-threaded TCG
+    *
+    * In the single-threaded case each vCPU is simulated in turn. If
+    * there is more than a single vCPU we create a simple timer to kick
+    * the vCPU and ensure we don't get stuck in a tight loop in one vCPU.
+    * This is done explicitly rather than relying on side-effects
+    * elsewhere.
+    */
     ```
-    在{/target/xxx/cpu.h}中还有一个类似的结构体，好像是各个CPU的单独实现
+1. 初始化
+    * assert(tcg_enabled()); 确保tcg启用
+    * rcu_register_thread(); {/util/rcu.c} 注册rcg,代码中注释：Reader thread registration，不清楚rcu是什么
+    * tcg_register_thread();
+        ```C
+        /*
+        * All TCG threads except the parent (i.e. the one that called tcg_context_init
+        * and registered the target's TCG globals) must register with this function
+        * before initiating translation.
+        *
+        * In user-mode we just point tcg_ctx to tcg_init_ctx. See the documentation
+        * of tcg_region_init() for the reasoning behind this.
+        *
+        * In softmmu each caller registers its context in tcg_ctxs[]. Note that in
+        * softmmu tcg_ctxs[] does not track tcg_ctx_init, since the initial context
+        * is not used anymore for translation once this function is called.
+        *
+        * Not tracking tcg_init_ctx in tcg_ctxs[] in softmmu keeps code that iterates
+        * over the array (e.g. tcg_code_size() the same for both softmmu and user-mode.
+        */
+        ```
+    * while (first_cpu->stopped) {} 应该是循环等待所有CPU初始化完成
+        ``` C
+        /* wait for initial kick-off after machine start */
+        while (first_cpu->stopped) {
+            qemu_cond_wait(first_cpu->halt_cond, &qemu_global_mutex);
 
-
-### tb_find {/accel/tcg/cpu-exec.c}
-    - 主要调用函数`tb_find`
-
-### tb_lookup__cpu_state {/include/exec/tb_lookup.h}
-        主要功能：查找下一个tb，并生成host代码。主要调用函数
-        - tb_lookup__cpu_state{/include/exec/tb_lookup.h} 
-            调用cpu_get_tb_cpu_state，根据cpu不同，执行不同函数，获取当前cpu的PC, BP, Flags等等。（BP是什么？）
-            ``` C
-            cpu_get_tb_cpu_state(env, pc, cs_base, flags);
-            ```
-            然后根据pc值找到对应的tb
-
-            ``` C
-            hash = tb_jmp_cache_hash_func(*pc);
-            tb = atomic_rcu_read(&cpu->tb_jmp_cache[hash]);
-            ```
-            `tb_jmp_cache_hash_func`是通过pc值从hash表中找到索引的函数。(This is a hash function to find offset of TB in tb_jmp_cache using the PC as key)
-            当一个tb存储在tb_jmp_cache中时，可以直接通过通过pc值从hash表中找到，然后代码会检查找到的tb的有效性(The code then follows to check the validity of the found TB)？
-            ``` C
-            if (likely(tb &&
-                    tb->pc == *pc &&
-                    tb->cs_base == *cs_base &&
-                    tb->flags == *flags &&
-                    tb->trace_vcpu_dstate == *cpu->trace_dstate &&
-                    (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == cf_mask)) {
-                return tb;
+            /* process any pending work */
+            CPU_FOREACH(cpu) {
+                current_cpu = cpu;
+                qemu_wait_io_event_common(cpu);
             }
-            ```
-            如果找到的tb是无效的，则会进行一个速度更慢的查找
-            ``` C
-            tb = tb_htable_lookup(cpu, *pc, *cs_base, *flags, cf_mask);
-            ```
+        }
+        ```
+        这里的first_cpu {/include/qom/cpu.h}是一个宏定义，从CPU队列里得到第一个CPU，`#define first_cpu QTAILQ_FIRST(&cpus)`。current_cpu{/exec.c} 是一个全局变量 `__thread CPUState *current_cpu;`，其中的`__thread`没有查到是什么意思
 
-### tb_gen_code {/accel/tcg/translate_all.c} 
-        - tb_gen_code{/accel/tcg/translate_all.c} 生成host代码
-            通过`tb_alloc()`分配一个新tb，这个tb的pc值通过`get_page_addr_code()`函数从cpustate中得到。
-            ``` C
-                phys_pc = get_page_addr_code(env, pc);
-                // ...
-                tb = tb_alloc(pc);
-                // ...
-                tcg_func_start(tcg_ctx);
+1. start_tcg_kick_timer() 函数注释中说的`don't get stuck in a tight loop in one vCPU`所用到的timer，这里是timer启动，后面如何判断不会超时的代码没有发现。
 
-                tcg_ctx->cpu = ENV_GET_CPU(env);
-                gen_intermediate_code(cpu, tb);
-                tcg_ctx->cpu = NULL;
+1. while(1)循环，应该会反复执行，没有发现break的条件
+    * 一些mutex lock操作，不清楚具体作用
+    * 将当前CPU设置为first_cpu
+    * 循环所有的CPU
+        * atomic_mb_set(&tcg_current_rr_cpu, cpu);
+        * if (cpu_can_run(cpu)) 如果当前cpu可以执行
+            * r = tcg_cpu_exec(cpu); 执行tcg代码
+            * 返回值r的相关宏定义在{/include/exec/cpu-all.h}
+            ```C
+            #define EXCP_INTERRUPT 	0x10000 /* async interruption */
+            #define EXCP_HLT        0x10001 /* hlt instruction reached */
+            #define EXCP_DEBUG      0x10002 /* cpu stopped after a breakpoint or singlestep */
+            #define EXCP_HALTED     0x10003 /* cpu is halted (waiting for external event) */
+            #define EXCP_YIELD      0x10004 /* cpu wants to yield timeslice to another */
+            #define EXCP_ATOMIC     0x10005 /* stop-the-world and emulate atomic */
             ```
+            * if (r == EXCP_DEBUG) cpu_handle_guest_debug() {/cpus.c} 处理debug相关
+            * if (r == EXCP_ATOMIC) cpu_exec_step_atomic() {/accel/tcg/cpu-exec.c} 原子性相关，不清楚具体含义
+        * if (cpu->stop)
+            * if (cpu->unplug) cpu = CPU_NEXT(cpu);
+            * break 跳出循环，不清楚为什么一个cpu停止就要跳出所有cpu的执行循环
+        * cpu = CPU_NEXT(cpu); 执行下一个cpu
+    * 不清楚这些代码在干什么
+        ```C
+        atomic_set(&tcg_current_rr_cpu, NULL);
 
-            - tcg_func_start() {/tcg/tcg.c}，为tcg_ctx分配了内存，还有些初始化操作，其他功能未知。
+        if (cpu && cpu->exit_request) {
+            atomic_mb_set(&cpu->exit_request, 0);
+        }
+
+        qemu_tcg_rr_wait_io_event(cpu ? cpu : QTAILQ_FIRST(&cpus));
+        deal_with_unplugged_cpus();
+        ```
+1. rcu_unregister_thread() 和初始化时注册rcu线程对应
+
+### tcg_cpu_exec `{/cpus.c}`
+1. cpu_exec_start(cpu);{/cpu-common.c}  
+    ```C
+    /* Wait for exclusive ops to finish, and begin cpu execution. */
+    ```
+1. ret = cpu_exec(cpu); {/accel/tcg/cpu-exec.c} 主要执行循环
+1. cpu_exec_end(cpu);{/cpu-common.c} 
+    ```C
+    /* Mark cpu as not executing, and release pending exclusive ops.  */
+    ```
+
+### cpu_handle_guest_debug
+todo
+
+### cpu_exec_step_atomic
+todo
+
+### cpu_exec `{/accel/tcg/cpu-exec.c}`
+todo: here
+1. 输入参数时`CPUState`{/include/qom/cpu.h}
+1. cc->cpu_exec_enter(cpu); Callback for cpu_exec preparation. 在cpu_class_init{/qom/cpu.c}中：`k->cpu_exec_enter = cpu_common_noop`。cpu_common_noop是一个空函数。
+1. if (sigsetjmp(cpu->jmp_env, 0) != 0) prepare setjmp context for exception handling
+1. while (!cpu_handle_exception(cpu, &ret)) if an exception is pending, we execute it here
+    * while (!cpu_handle_interrupt(cpu, &last_tb)) 处理中断
+        * tb = tb_find(cpu, last_tb, tb_exit, cflags); 查找tb
+        * cpu_loop_exec_tb(cpu, tb, &last_tb, &tb_exit); 执行tb
+        * align_clocks(&sc, cpu); 对齐host和虚拟时钟
+            ```C
+            /* Try to align the host and virtual clocks if the guest is in advance */
+            ```
+1. cc->cpu_exec_exit(cpu); 和cpu_exec_enter一样，也是cpu_common_noop，空函数。
+
+### cpu_handle_exception `{/accel/tcg/cpu-exec.c}`
+todo
+
+### cpu_handle_interrupt `{/accel/tcg/cpu-exec.c}`
+todo
+
+### cpu_loop_exec_tb `{/accel/tcg/cpu-exec.c}`
+执行tb生成的host代码，主要调用的函数
+- cpu_tb_exec
+- cpu_exec_nocache
+
+### tb_find `{/accel/tcg/cpu-exec.c}`
+1. tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask); 查找对应的tb
+1. 如果未找到，则生成tb，再将生成的tb加入到lookup表中。
+    ```C
+    if (tb == NULL) {
+        mmap_lock();
+        tb = tb_gen_code(cpu, pc, cs_base, flags, cf_mask);
+        mmap_unlock();
+        /* We add the TB in the virtual pc hash table for the fast lookup */
+        atomic_set(&cpu->tb_jmp_cache[tb_jmp_cache_hash_func(pc)], tb);
+    }
+    ```
+1. 处理跳转相关，这里的last_tb是再cpu_exec中经过cpu_handle_interrupt(cpu, &last_tb)处理过的，tb_exit=0， 不清除具体功能
+    ```C
+    if (last_tb && !qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN)) {
+        tb_add_jump(last_tb, tb_exit, tb);
+    }
+    ```
+
+### tb_lookup__cpu_state `{/include/exec/tb_lookup.h}`
+1. cpu_get_tb_cpu_state(env, pc, cs_base, flags) 调用cpu_get_tb_cpu_state，根据cpu不同，执行不同函数，获取当前cpu的PC, Flags等等。      
+1. 然后根据pc值找到对应的tb
+    ``` C
+    hash = tb_jmp_cache_hash_func(*pc);
+    tb = atomic_rcu_read(&cpu->tb_jmp_cache[hash]);
+    ```
+    * `tb_jmp_cache_hash_func`是通过pc值从hash表中找到索引的函数。(This is a hash function to find offset of TB in tb_jmp_cache using the PC as key)
+    * 当一个tb存储在tb_jmp_cache中时，可以直接通过通过pc值从hash表中找到，然后代码会检查找到的tb的有效性(The code then follows to check the validity of the found TB)？
+1. 检查tb有效性，如果有效则直接返回tb
+    ``` C
+    if (likely(tb &&
+            tb->pc == *pc &&
+            tb->cs_base == *cs_base &&
+            tb->flags == *flags &&
+            tb->trace_vcpu_dstate == *cpu->trace_dstate &&
+            (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == cf_mask)) {
+        return tb;
+    }
+    ```
+1. 否则更慢速查找tb
+    ``` C
+    tb = tb_htable_lookup(cpu, *pc, *cs_base, *flags, cf_mask);
+    ```
+1. 如果仍未找到，返回NULL，否则将找到的tb加入tb_jmp_cache，方便下次查找，再返回tb
+    ```C
+    if (tb == NULL) {
+        return NULL;
+    }
+    atomic_set(&cpu->tb_jmp_cache[hash], tb);
+    return tb;
+    ```
+### tb_htable_lookup `{/accel/tcg/cpu-exec.c}`
+更慢速查找tb的函数
+1. phys_pc是guest上的物理地址，用来查找下一个TB。phys_pc should be the physical memory address of  the Guest OS’s PC, and it is used to find the next TB through a hash function.
+    ```C
+    phys_pc = get_page_addr_code(desc.env, pc);
+    ```
+1. phys_pc计算hash，再通过hash查找tb并返回
+    ```C
+    h = tb_hash_func(phys_pc, pc, flags, cf_mask, *cpu->trace_dstate);
+    return qht_lookup_custom(&tb_ctx.htable, &desc, h, tb_lookup_cmp);
+    ```
+### struct TranslationBlock `{/include/exec/exec-all.h}`
+1. 下面是早期版本的解析，现在版本已经不同。
+    > Structure TranslationBlock contains the following; PC, CS_BASE, Flags corresponding to this TB, tc_ptr (a pointer to the translated code of this TB), tb_next_offset[2], tb_jmp_offset[2] (both to find the TBs chained to this TB. ie. the TB that follows this TB), *jmp_next[2], *jmp_first (points to the TBs that jump into this TB).
+1. TB包含以下内容：
+    * 这个TB对应的PC, CS_BASE, Flags；
+    * struct tb_tc tc; Translation Cache相关的指针
+        ```C
+        /*
+        * Translation Cache-related fields of a TB.
+        * This struct exists just for convenience; we keep track of TB's in a binary
+        * search tree, and the only fields needed to compare TB's in the tree are
+        * @ptr and @size.
+        * Note: the address of search data can be obtained by adding @size to @ptr.
+        */
+        ```
+    * 指向代码页的指针，这里应该是指的target代码？
+        ```C
+        /* first and second physical page containing code. The lower bit
+        of the pointer tells the index in page_next[].
+        The list is protected by the TB's page('s) lock(s) */
+        uintptr_t page_next[2];
+        tb_page_addr_t page_addr[2];
+        ```
+    * 用来跳转到其他TB的指针，最多支持两个跳转方向。
+        ```C
+        /* The following data are used to directly call another TB from
+        * the code of this one. This can be done either by emitting direct or
+        * indirect native jump instructions. These jumps are reset so that the TB
+        * just continues its execution. The TB can be linked to another one by
+        * setting one of the jump targets (or patching the jump instruction). Only
+        * two of such jumps are supported.
+        */
+        uint16_t jmp_reset_offset[2]; /* offset of original jump target */
+        #define TB_JMP_RESET_OFFSET_INVALID 0xffff /* indicates no jump generated */
+        uintptr_t jmp_target_arg[2];  /* target address or offset */
+        ```
+        按照注释的描述，jmp_reset_offset是在跳转reset时使用的，应该是跳转到这个TB的TB地址。但是后面又有一组指针来专门存储incoming jumps，这样来看，reset的时候就时跳回当前TB，但这样jmp_reset_offset的含义就很奇怪，因为没有必要存储自己的地址。
+    * jmp_list_head是所有incoming jumps组成的列表的头（很奇怪，为什么要用链表来存这些？），链表用NULL结尾。每个TB有两个跳转方向，因此就可能出现在两个list中，这些list的入口存储在jmp_list_next[2]中，指针的最低有效位用来表示哪个list是真正指向（下一个）TB的。jmp_dest[]用来存储所有的outgoing jump，是tagged指针（含义？）
+        ```C
+        /*
+        * Each TB has a NULL-terminated list (jmp_list_head) of incoming jumps.
+        * Each TB can have two outgoing jumps, and therefore can participate
+        * in two lists. The list entries are kept in jmp_list_next[2]. The least
+        * significant bit (LSB) of the pointers in these lists is used to encode
+        * which of the two list entries is to be used in the pointed TB.
+        *
+        * List traversals are protected by jmp_lock. The destination TB of each
+        * outgoing jump is kept in jmp_dest[] so that the appropriate jmp_lock
+        * can be acquired from any origin TB.
+        *
+        * jmp_dest[] are tagged pointers as well. The LSB is set when the TB is
+        * being invalidated, so that no further outgoing jumps from it can be set.
+        *
+        * jmp_lock also protects the CF_INVALID cflag; a jump must not be chained
+        * to a destination TB that has CF_INVALID set.
+        */
+        uintptr_t jmp_list_head;
+        uintptr_t jmp_list_next[2];
+        uintptr_t jmp_dest[2];
+        ```
+        整个这段注释都没有十分的理解，和上一段一样，感觉不清楚在说什么。
+
+### tb_gen_code `{/accel/tcg/translate_all.c}`
+1. 创建一个新tb
+    ```C
+    phys_pc = get_page_addr_code(env, pc);    
+    tb = tb_alloc(pc);
+    ```
+    * Function tb_gen_code starts with allocating   ( tb_alloc() ) a new TB, the PC for the TB is found from the PC of CPUState using get_page_addr_code(). 
+    * get_page_addr_code{/include/exec/exec-all.h} 函数定义如下，
+        ```C
+        static inline tb_page_addr_t get_page_addr_code(CPUArchState *env1, target_ulong addr)
+        {
+            return addr;
+        }
+        ```
+        相当于函数直接返回了pc，并没有发现phys_pc在哪里被使用，tb_alloc时使用的还是当前pc值。
+1. 检查新建从tb有效性，如果无效则直接生成中断，并退出
+    ```C
+    if (unlikely(!tb)) {
+        /* flush must be done */
+        tb_flush(cpu);
+        mmap_unlock();
+        /* Make the execution loop process the flush as soon as possible.  */
+        cpu->exception_index = EXCP_INTERRUPT;
+        cpu_loop_exit(cpu);
+    }
+    ```
+1. 给新建的tb赋值
+    ```C
+    gen_code_buf = tcg_ctx->code_gen_ptr;
+    tb->tc.ptr = gen_code_buf;
+    tb->pc = pc;
+    tb->cs_base = cs_base;
+    tb->flags = flags;
+    tb->cflags = cflags;
+    tb->trace_vcpu_dstate = *cpu->trace_dstate;
+    tcg_ctx->tb_cflags = cflags;
+    ```
+    其中tcg_ctx的声明为`extern __thread TCGContext *tcg_ctx;`{/tcg/tcg.h}，没有找到定义的地方。
+1. tcg_func_start() {/tcg/tcg.c}，为tcg_ctx分配了内存，还有些初始化操作，其他功能未知。
+1. 将target代码转换到tcg代码，前后分别给tcg_ctx->cpu赋值不清楚意义何在
+    ```C
+    tcg_ctx->cpu = ENV_GET_CPU(env);
+    gen_intermediate_code(cpu, tb);
+    tcg_ctx->cpu = NULL;
+    ```
+1. trace_translate_block(tb, tb->pc, tb->tc.ptr) 
+    未找到...
+1. tcg_gen_code(tcg_ctx, tb) {/tcg/tcg.c} 从tcg转换为host执行的代码
+1. tb_link_page(tb, phys_pc, phys_page2) `{/accel/tcg/translate_all.c}`
+    ```C
+    /* add a new TB and link it to the physical page tables. phys_page2 is
+    * (-1) to indicate that only one page contains the TB.
+    *
+    * Called with mmap_lock held for user-mode emulation.
+    *
+    * Returns a pointer @tb, or a pointer to an existing TB that matches @tb.
+    * Note that in !user-mode, another thread might have already added a TB
+    * for the same block of guest code that @tb corresponds to. In that case,
+    * the caller should discard the original @tb, and use instead the returned TB.
+    */
+    ```
+1. tcg_tb_insert(tb) `{/tcg/tcg.c}`
 
 ### gen_intermediate_code {/target/xxx/translate.c}
-            - gen_intermediate_code(){/target/xxx/translate.c}，应该是转换guest->tcg代码。每个target下均有该函数，将target代码转换为tcg代码（generate intermediate code for basic block 'tb'）
-            
-                该函数会首先生成好一个ops，是下面结构体的实例：
-                
-                TranslatorOps{/accel/tcg/translater.h}结构定义如下。`Disas`应该是disassembly的缩写。
-                ``` C
-                /**
-                * TranslatorOps:
-                * @init_disas_context:
-                *      Initialize the target-specific portions of DisasContext struct.
-                *      The generic DisasContextBase has already been initialized.
-                *
-                * @tb_start:
-                *      Emit any code required before the start of the main loop,
-                *      after the generic gen_tb_start().
-                *
-                * @insn_start:
-                *      Emit the tcg_gen_insn_start opcode.
-                *
-                * @breakpoint_check:
-                *      When called, the breakpoint has already been checked to match the PC,
-                *      but the target may decide the breakpoint missed the address
-                *      (e.g., due to conditions encoded in their flags).  Return true to
-                *      indicate that the breakpoint did hit, in which case no more breakpoints
-                *      are checked.  If the breakpoint did hit, emit any code required to
-                *      signal the exception, and set db->is_jmp as necessary to terminate
-                *      the main loop.
-                *
-                * @translate_insn:
-                *      Disassemble one instruction and set db->pc_next for the start
-                *      of the following instruction.  Set db->is_jmp as necessary to
-                *      terminate the main loop.
-                *
-                * @tb_stop:
-                *      Emit any opcodes required to exit the TB, based on db->is_jmp.
-                *
-                * @disas_log:
-                *      Print instruction disassembly to log.
-                */
-                typedef struct TranslatorOps {
-                    void (*init_disas_context)(DisasContextBase *db, CPUState *cpu);
-                    void (*tb_start)(DisasContextBase *db, CPUState *cpu);
-                    void (*insn_start)(DisasContextBase *db, CPUState *cpu);
-                    bool (*breakpoint_check)(DisasContextBase *db, CPUState *cpu,
-                                            const CPUBreakpoint *bp);
-                    void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
-                    void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
-                    void (*disas_log)(const DisasContextBase *db, CPUState *cpu);
-                } TranslatorOps;
+应该是转换guest->tcg代码。每个target下均有该函数，将target代码转换为tcg代码（generate intermediate code for basic block 'tb'）
+    
+1. 在translate.c文件中会定义一个xxx_xxx_ops的变量：
 
-                /**
-                * DisasContextBase:
-                * @tb: Translation block for this disassembly.
-                * @pc_first: Address of first guest instruction in this TB.
-                * @pc_next: Address of next guest instruction in this TB (current during
-                *           disassembly).
-                * @is_jmp: What instruction to disassemble next.
-                * @num_insns: Number of translated instructions (including current).
-                * @max_insns: Maximum number of instructions to be translated in this TB.
-                * @singlestep_enabled: "Hardware" single stepping enabled.
-                *
-                * Architecture-agnostic disassembly context.
-                */
-                typedef struct DisasContextBase {
-                    TranslationBlock *tb;
-                    target_ulong pc_first;
-                    target_ulong pc_next;
-                    DisasJumpType is_jmp;
-                    int num_insns;
-                    int max_insns;
-                    bool singlestep_enabled;
-                } DisasContextBase;
-                ```
-                这个结构体中存的都是函数指针，在每个target/translate.c文件中都会对这个结构体进行实例化，结构体中每个成员函数就是对应的功能入口，均在同一个文件中。
-                ``` C
-                static const TranslatorOps arm_translator_ops = {
-                    .init_disas_context = arm_tr_init_disas_context,
-                    .tb_start           = arm_tr_tb_start,
-                    .insn_start         = arm_tr_insn_start,
-                    .breakpoint_check   = arm_tr_breakpoint_check,
-                    .translate_insn     = arm_tr_translate_insn,
-                    .tb_stop            = arm_tr_tb_stop,
-                    .disas_log          = arm_tr_disas_log,
-                };
-                ```
+    TranslatorOps{/accel/tcg/translater.h}结构定义如下。`Disas`应该是disassembly的缩写。
+
+    ``` C
+    /**
+    * TranslatorOps:
+    * @init_disas_context:
+    *      Initialize the target-specific portions of DisasContext struct.
+    *      The generic DisasContextBase has already been initialized.
+    *
+    * @tb_start:
+    *      Emit any code required before the start of the main loop,
+    *      after the generic gen_tb_start().
+    *
+    * @insn_start:
+    *      Emit the tcg_gen_insn_start opcode.
+    *
+    * @breakpoint_check:
+    *      When called, the breakpoint has already been checked to match the PC,
+    *      but the target may decide the breakpoint missed the address
+    *      (e.g., due to conditions encoded in their flags).  Return true to
+    *      indicate that the breakpoint did hit, in which case no more breakpoints
+    *      are checked.  If the breakpoint did hit, emit any code required to
+    *      signal the exception, and set db->is_jmp as necessary to terminate
+    *      the main loop.
+    *
+    * @translate_insn:
+    *      Disassemble one instruction and set db->pc_next for the start
+    *      of the following instruction.  Set db->is_jmp as necessary to
+    *      terminate the main loop.
+    *
+    * @tb_stop:
+    *      Emit any opcodes required to exit the TB, based on db->is_jmp.
+    *
+    * @disas_log:
+    *      Print instruction disassembly to log.
+    */
+    typedef struct TranslatorOps {
+        void (*init_disas_context)(DisasContextBase *db, CPUState *cpu);
+        void (*tb_start)(DisasContextBase *db, CPUState *cpu);
+        void (*insn_start)(DisasContextBase *db, CPUState *cpu);
+        bool (*breakpoint_check)(DisasContextBase *db, CPUState *cpu,
+                                const CPUBreakpoint *bp);
+        void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
+        void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
+        void (*disas_log)(const DisasContextBase *db, CPUState *cpu);
+    } TranslatorOps;
+
+    /**
+    * DisasContextBase:
+    * @tb: Translation block for this disassembly.
+    * @pc_first: Address of first guest instruction in this TB.
+    * @pc_next: Address of next guest instruction in this TB (current during
+    *           disassembly).
+    * @is_jmp: What instruction to disassemble next.
+    * @num_insns: Number of translated instructions (including current).
+    * @max_insns: Maximum number of instructions to be translated in this TB.
+    * @singlestep_enabled: "Hardware" single stepping enabled.
+    *
+    * Architecture-agnostic disassembly context.
+    */
+    typedef struct DisasContextBase {
+        TranslationBlock *tb;
+        target_ulong pc_first;
+        target_ulong pc_next;
+        DisasJumpType is_jmp;
+        int num_insns;
+        int max_insns;
+        bool singlestep_enabled;
+    } DisasContextBase;
+    ```
+
+    这个结构体中存的都是函数指针，在每个target/translate.c文件中都会对这个结构体进行实例化，结构体中每个成员函数就是对应的功能入口，均在同一个文件中。
+
+    ``` C
+    static const TranslatorOps arm_translator_ops = {
+        .init_disas_context = arm_tr_init_disas_context,
+        .tb_start           = arm_tr_tb_start,
+        .insn_start         = arm_tr_insn_start,
+        .breakpoint_check   = arm_tr_breakpoint_check,
+        .translate_insn     = arm_tr_translate_insn,
+        .tb_stop            = arm_tr_tb_stop,
+        .disas_log          = arm_tr_disas_log,
+    };
+    ```
+1. 调用translator_loop{accel/tcg/translator.c,accel/tcg/translator.h}函数实现target->tcg代码的转换。
 
 ### translator_loop {accel/tcg/translator.c,accel/tcg/translator.h}
-
-                定义好ops后，会调用translator_loop()函数来实现target->tcg代码的转换。
-
-                translator_loop() {accel/tcg/translator.c,accel/tcg/translator.h}
-                ``` C
-                /**
-                * translator_loop:
-                * @ops: Target-specific operations.
-                * @db: Disassembly context.
-                * @cpu: Target vCPU.
-                * @tb: Translation block.
-                *
-                * Generic translator loop.
-                *
-                * Translation will stop in the following cases (in order):
-                * - When is_jmp set by #TranslatorOps::breakpoint_check.
-                *   - set to DISAS_TOO_MANY exits after translating one more insn
-                *   - set to any other value than DISAS_NEXT exits immediately.
-                * - When is_jmp set by #TranslatorOps::translate_insn.
-                *   - set to any value other than DISAS_NEXT exits immediately.
-                * - When the TCG operation buffer is full.
-                * - When single-stepping is enabled (system-wide or on the current vCPU).
-                * - When too many instructions have been translated.
-                */
-                void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
-                                    CPUState *cpu, TranslationBlock *tb);
-                ```
+    ``` C
+    /**
+    * translator_loop:
+    * @ops: Target-specific operations.
+    * @db: Disassembly context.
+    * @cpu: Target vCPU.
+    * @tb: Translation block.
+    *
+    * Generic translator loop.
+    *
+    * Translation will stop in the following cases (in order):
+    * - When is_jmp set by #TranslatorOps::breakpoint_check.
+    *   - set to DISAS_TOO_MANY exits after translating one more insn
+    *   - set to any other value than DISAS_NEXT exits immediately.
+    * - When is_jmp set by #TranslatorOps::translate_insn.
+    *   - set to any value other than DISAS_NEXT exits immediately.
+    * - When the TCG operation buffer is full.
+    * - When single-stepping is enabled (system-wide or on the current vCPU).
+    * - When too many instructions have been translated.
+    */
+    void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
+                        CPUState *cpu, TranslationBlock *tb);
+    ```
                 
-                查看了几个target下的translator_loop函数调用，发现第二个参数db均是在gen_intermediate_code()中定义的一个空结构体。这个变量在translator_loop首先会被初始化，按照函数注释，这个变量中存储的是反汇编内容，应该指的是转换后的tcg码。但是db并没有作为返回值，应该会在函数结束后消亡，应该在translator_loop中子函数中保存了它，还需要进一步观察。
+查看了几个target下的translator_loop函数调用，发现第二个参数db均是在gen_intermediate_code()中定义的一个空结构体。这个变量在translator_loop首先会被初始化，按照函数注释，这个变量中存储的是反汇编内容，应该指的是转换后的tcg码。但是db并没有作为返回值，应该会在函数结束后消亡，应该在translator_loop中子函数中保存了它，还需要进一步观察。
 
-                translator_loop函数结构比较简单，流程如下：
-                1. 初始化`DisasContext`
-                1. `Instruction counting` 给db->max_insns变量赋值，这个tb中的将要译码的最大指令数量
-                1. ops->init_disas_context(db, cpu)。 ops成员函数，对每个target会使用对应的函数。Initialize the target-specific portions of DisasContext struct. The generic DisasContextBase has already been initialized. 前面初始化的是DisasContext的公共部分，这里是对每个target调用专有的初始化函数。
-                1. tcg_clear_temp_count()。 /* Reset the temp count so that we can identify leaks */
-                1. gen_tb_start(db->tb){/exec/gen-icount.h}。这个文件中有好几个类似函数，文件注释是/* Helpers for instruction counting code generation.  */，应该是在执行过程中的辅助函数，程序计数用？
-                1. ops->tb_start(db, cpu)。ops成员函数，Emit any code required before the start of the main loop，after the generic gen_tb_start().没理解注释含义，待后续查看函数内容再说。
-                1. while循环开始，逐条开始译码。
-                    1. 程序计数加一，调用ops->insn_start(db, cpu)
-                    1. 检查调试断点，如果下一条指令是断点，调用ops->breakpoint_check(db, cpu, bp)，并结束while
-                    1. 调用ops->translate_insn(db, cpu)进行译码，有一个当前指令书等于最大指令数的特殊判断，不清楚具体作用
-                    1. 结束循环判断。一是db->is_jmp不是译码下一条指令`DISAS_NEXT`，二是tcg_op_buf_full() 或者 db->num_insns >= db->max_insns，指令数超上限
-                1. ops->tb_stop(db, cpu)。 Emit any opcodes required to exit the TB, based on db->is_jmp.
-                1. gen_tb_end(db->tb, db->num_insns);？？
+translator_loop函数结构比较简单，流程如下：
+1. 初始化`DisasContext`
+1. `Instruction counting` 给db->max_insns变量赋值，这个tb中的将要译码的最大指令数量
+1. ops->init_disas_context(db, cpu)。 ops成员函数，对每个target会使用对应的函数。Initialize the target-specific portions of DisasContext struct. The generic DisasContextBase has already been initialized. 前面初始化的是DisasContext的公共部分，这里是对每个target调用专有的初始化函数。
+1. tcg_clear_temp_count()。 /* Reset the temp count so that we can identify leaks */
+1. gen_tb_start(db->tb){/exec/gen-icount.h}。这个文件中有好几个类似函数，文件注释是/* Helpers for instruction counting code generation.  */，应该是在执行过程中的辅助函数，程序计数用？
+1. ops->tb_start(db, cpu)。ops成员函数，Emit any code required before the start of the main loop，after the generic gen_tb_start().没理解注释含义，待后续查看函数内容再说。
+1. while循环开始，逐条开始译码。
+    1. 程序计数加一，调用ops->insn_start(db, cpu)
+    1. 检查调试断点，如果下一条指令是断点，调用ops->breakpoint_check(db, cpu, bp)，并结束while
+    1. 调用ops->translate_insn(db, cpu)进行译码，有一个当前指令书等于最大指令数的特殊判断，不清楚具体作用
+    1. 结束循环判断。一是db->is_jmp不是译码下一条指令`DISAS_NEXT`，二是tcg_op_buf_full() 或者 db->num_insns >= db->max_insns，指令数超上限
+1. ops->tb_stop(db, cpu)。 Emit any opcodes required to exit the TB, based on db->is_jmp.
+1. gen_tb_end(db->tb, db->num_insns);？？
 
-                简单看了一下每个target目录下的文件，感觉openrisc的最简单，准备分析一下它的
-                下面以openrisc为例逐项解析ops中的各个函数{/target/openrisc/translate.c}
-                .init_disas_context = openrisc_tr_init_disas_context 新建了一个DisasContext，并对其进行了初始化赋值，不清楚具体每个参数的含义
-                .tb_start = openrisc_tr_tb_start 设置了寄存器R0，不知为何
-                .insn_start = openrisc_tr_insn_start 发出tcg_gen_insn_start指令
-                .breakpoint_check = openrisc_tr_breakpoint_check,设置断点，再下一条指令设置了跳转，并且将跳转类型设置为DISAS_NORETURN，没理解为什么，这样可以再程序停止运行，然后在需要继续的时候由调试器返回？
-                .translate_insn = openrisc_tr_translate_insn,调用了/scripts/decodetree.py，通过这个脚本生成了一个c文件，decode.inc.c，这文件中包含了译码函数decode，具体指令译码的格式在insns.decode文件中
-                .tb_stop = openrisc_tr_tb_stop,对于不同类型的跳转进行了分别处理
-                .disas_log = openrisc_tr_disas_log,
+下面以openrisc为例逐项解析ops中的各个函数{/target/openrisc/translate.c}
+.init_disas_context = openrisc_tr_init_disas_context 新建了一个DisasContext，并对其进行了初始化赋值，不清楚具体每个参数的含义
+.tb_start = openrisc_tr_tb_start 设置了寄存器R0，不知为何
+.insn_start = openrisc_tr_insn_start 发出tcg_gen_insn_start指令
+.breakpoint_check = openrisc_tr_breakpoint_check,设置断点，再下一条指令设置了跳转，并且将跳转类型设置为DISAS_NORETURN，没理解为什么，这样可以再程序停止运行，然后在需要继续的时候由调试器返回？
+.translate_insn = openrisc_tr_translate_insn,调用了/scripts/decodetree.py，通过这个脚本生成了一个c文件，decode.inc.c，这文件中包含了译码函数decode，具体指令译码的格式在insns.decode文件中
+.tb_stop = openrisc_tr_tb_stop,对于不同类型的跳转进行了分别处理
+.disas_log = openrisc_tr_disas_log
 
 ### tcg_gen_code {/tcg/tcg.c}
-            - tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
+tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
 
-
-    - 主要调用函数`cpu_loop_exec_tb`
-
-    执行tb生成的host代码，主要调用的函数
-        - cpu_tb_exec
-        - cpu_exec_nocache
-
-
-1. struct TranslationBlock{/include/exec/exec-all.h} TB定义
-Structure TranslationBlock contains the following; PC, CS_BASE, Flags corresponding to this TB, tc_ptr (a pointer to the translated code of this TB), tb_next_offset[2], tb_jmp_offset[2] (both to find the TBs chained to this TB. ie. the TB that follows this TB), *jmp_next[2], *jmp_first (points to the TBs that jump into this TB). 
-
-
-1. {/accel/tcg/translate-all.h}  TranslationBlock structure in translate-all.h Translation cache is code gen buffer in exec.c cpu-exec() in cpu-exec.c orchestrates translation and block chaining. 
-2. {/target/xxx/translate.c}: guest ISA speciﬁc code. 
-3. {tcg-*/*/}: host ISA speciﬁc code.
-4. {linux-user/*}: Linux usermode speciﬁc code. 
-7. hw/*: Hardware, including video, audio, and boards.
-
-
-https://people.cs.nctu.edu.tw/~chenwj/dokuwiki/doku.php?id=qemu
-
+（既然qemu已经是c语言写的，那么在qemu编译完成后，在qemu运行过程中动态产生的tcg代码应该就可以直接被host执行了，这里的转换起什么作用？）
 
 # tcg讲解
 https://chemnitzer.linux-tage.de/2012/vortraege/1062
@@ -548,3 +775,11 @@ tcg使用方法
 1. 直接使用qemu提供的tcg中间函数去构建自己的guest指令，将guest指令转换为tcg执行后再执行
 2. 使用tcg_helper来构建复杂guest指令，tcg在运行时会直接调用对应的helper函数，这样，guest指令直接转换为c代码运行
 3. tcg中间代码微指令类型总结https://blog.csdn.net/lulu901130/article/details/45716883
+
+# 其他
+1. {/target/xxx/translate.c}: guest ISA speciﬁc code. 
+3. {tcg-*/*/}: host ISA speciﬁc code.
+4. {linux-user/*}: Linux usermode speciﬁc code. 
+7. hw/*: Hardware, including video, audio, and boards.
+
+https://people.cs.nctu.edu.tw/~chenwj/dokuwiki/doku.php?id=qemu
