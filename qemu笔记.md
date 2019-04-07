@@ -5,9 +5,6 @@
         - 如何让qemu加载添加的新构架
         - 如何配置configure，可以正确的编译新增代码
 
-下步工作：
-1. gen_intermediate_code函数分析
-1. 重新调整文档格式
         
 # 编译安装
 linux安装指导：https://wiki.qemu.org/Hosts/Linux
@@ -64,6 +61,23 @@ make
 * qemu-ga：这是一个不利用网络实现 guest 和 host 之间交互的应用程序（使用 virtio-serial），运行在 guest 中。
 * qemu-io：这是一个执行 Qemu I/O 操作的命令行工具。
 * qemu-nbd：磁盘挂载工具。
+
+### 用户模式和系统模式
+qemu-{target}和qemu-system-{target}的区别：
+qemu-{target}是用户模式的模拟器(更精确的表述应该是系统调用模拟器)，而qemu-system-{target}则是系统模拟器，它可以模拟出整个机器并运行操作系统
+qemu-{target}仅可用来运行二进制文件，因此你可以交叉编译完例如hello world之类的程序然后交给qemu-{target}来运行，简单而高效。而qemu-system-{target}则需要你把hello world程序下载到客户机操作系统能访问到的硬盘里才能运行。
+
+对于下面的命令
+```shell
+./configure --target-list=arm-softmmu,arm-linux-user
+```
+会生成两个执行程序，分别是qemu-system-arm, qemu-arm
+
+如果需要使用qemu-arm来执行自己编写的c代码：
+1. 需要安装交叉编译工具`sudo apt-get install gcc-arm-linux-gnueabi`
+1. 然后使用`arm-linux-gnueabi-gcc test.c -o test`
+1. 最后`qemu-arm -L /usr/arm-linux-gnueabi -cpu cortex-a15 test`。如果不用-L指定库的位置，那么运行时会提示`/lib/ld-linux.so.3: No such file or directory`
+1. 也可以在编译代码的时候采用静态编译，加-static
 
 # 使用GDB调试
 运行`gdb --args ./qemu-system-x86_64 -L pc-bios`（--args后面时qemu的运行命令，可以运行其他镜像）。然后可以使用gdb命令进行设置断电例如`break main`，在main函数设置断点。
@@ -763,6 +777,10 @@ translator_loop函数结构比较简单，流程如下：
 .tb_stop = openrisc_tr_tb_stop,对于不同类型的跳转进行了分别处理
 .disas_log = openrisc_tr_disas_log
 
+### disas_arm_insn {/target/arm/translate.c}
+翻译arm指令到tcg
+通过gdb设置断点到该函数，可以查看到指令译码的过程，修改该译码过程后，重新编译qemu就可以得到经过自定义指令调整的qemu模拟器。
+
 ### tcg_gen_code {/tcg/tcg.c}
 tcg_gen_code() {/tcg/tcg.c},将tcg代码转换为host代码，这个函数实现的是前面《TCG-动态翻译》一节描述的过程（这里是tcg->host的过程，我们要修改的是guest->tcg的过程，应该不需要更改这里的代码，没有细看）。
 
@@ -776,6 +794,132 @@ tcg使用方法
 2. 使用tcg_helper来构建复杂guest指令，tcg在运行时会直接调用对应的helper函数，这样，guest指令直接转换为c代码运行
 3. tcg中间代码微指令类型总结https://blog.csdn.net/lulu901130/article/details/45716883
 
+# 添加自定义指令
+为了测试添加/修改指令，我们需要完成以下工作：
+1. 编写client执行程序，即该程序需要使用qemu来模拟运行
+1. 修改qemu中的指令译码部分代码，添加/修改client程序中所执行的指令所对应的代码
+1. 通过gdb调试查看修改后的指令是否正确执行
+
+## 编写程序
+可以编写C程序，也可以编写汇编程序。C程序通过user方式模拟linux运行，通过gcc编译生成的代码可以通过反汇编查看；汇编程序用system方式运行，不会产生多余的代码。
+
+这里用到的编译器都是交叉编译，即在host机器上编译guest代码
+
+### C程序
+1. arm的交叉编译工具链可以通过`sudo apt-get install gcc-arm-linux-gnueabi`安装（https://www.cnblogs.com/muyun/p/3370996.html）
+1. arm-linux-gnueabi-gcc 编译器gcc，和gcc用法相同，将c代码编译成可执行文件。
+1. arm-linux-gnueabi-objdump 反汇编，将编译好的程序dump成汇编码
+    `arm-linux-gnueabi-objdump -S hello > dump1.txt`
+    反汇编后的程序显示为如下格式
+    ```
+    ...
+    000103fc <main>:
+    103fc:	e92d4800 	push	{fp, lr}
+    10400:	e28db004 	add	fp, sp, #4
+    10404:	e59f000c 	ldr	r0, [pc, #12]	; 10418 <main+0x1c>
+    10408:	ebffffb3 	bl	102dc <puts@plt>
+    1040c:	e3a03000 	mov	r3, #0
+    10410:	e1a00003 	mov	r0, r3
+    10414:	e8bd8800 	pop	{fp, pc}
+    10418:	0001048c 	.word	0x0001048c
+    ...
+    ```
+    其中机器码部分为little edian，即e9 2d 48 00 在程序二进制中存储为00 48 2d e9，通过二进制编辑器打开可执行程序可以找到每行机器码所在位置。
+1. 使用qemu-arm运行生成好的执行文件
+
+### 汇编程序
+参考https://www.anquanke.com/post/id/86383，主要使用arm-linux-gnueabi-as、arm-linux-gnueabi-gcc、arm-linux-gnueabi-ld工具
+1. 测试用的汇编程序代码如下，保存为test.s文件
+    ``` 
+    .global   _start
+    _start: 
+        mrs  r0, cpsr  # 将状态寄存器CPSR中的内容传送至R0
+        bic  r0, #0x1f # Rd,  Rn, Oprand2 
+        # BIC（位清除）指令对 Rn 中的值 和 Operand2 值的反码按位进行逻辑“与”运算。 (注意:ARM官方网站有误, 写的是补码)
+        # BIC 是 逻辑”与非” 指令, 实现的 Bit Clear的功能
+        orr  r0, #0x12
+        msr  cpsr, r0
+        nop
+        b  end
+
+    .end
+    ```
+1. 汇编
+`arm-linux-gnueabi-gcc test.s -o test.o -c -g`
+1. ld
+`arm-linux-gnueabi-ld -Ttext 0x00000000  test.o -o test.elf`
+1. 运行
+`./qemu-system-arm -machine vexpress-a9 -m 256M -serial stdio -kernel test.elf -S -s`
+
+    -machine vexpress-a9：指定开发板，该开发板是QEMU中支持的一款ARM公司的基于Cortex-A9的开发板
+    -m 256M：指定物理内存的大小
+    -serial stdio：指定串口为标准输入输出
+    -kernel test.elf：指定要运行的elf格式的可执行文件
+    -S：虚拟机启动后立即暂停,等侍gdb连接, “freeze CPU at start up”
+    -s：在1234接受gdb调试连接
+
+1. 调试
+这里用的是交叉编译后的调试arm版gdb（参加后文gdb交叉编译）
+`arm-none-linux-gnueabi-gdb  test.elf`
+1. 然后连接远程
+`target  remote  localhost:1234`
+1. 图形界面
+`sudo apt-get install ddd` 安装ddd
+`ddd --debugger ./arm-none-linux-gnueabi-gdb test.elf` 用ddd调用arm版gdb调试程序
+
+    这里可以看见汇编码，以及对应的机器码，并可以单步执行，执行结果可以通过查看寄存器看到。
+
+1. 参考资料：
+    qemu进行ARM CPU仿真及程序gdb调试 https://blog.csdn.net/ass_dsb/article/details/78744614?utm_source=blogxgwz5
+
+    qemu+arm-linux-gdb模拟运行ARM程序 http://emb.hqyj.com/Column/3657.html
+
+1. 机器码
+arm-linux-gnueabi-objcopy -O binary -S test.elf test.bin 变成纯机器码，二进制打开后可以和汇编指令一一对应
+执行 ./qemu-system-arm -machine vexpress-a9 -m 256M -serial stdio -kernel test.bin -S -s 后，用gdb连接调试，并单步执行，可以发现qemu先执行了一些其他指令（不清楚内容，也不清楚从哪里来的），然后跳转到新的内存地址，开始test.bin对应的程序，ddd的machine code window可以看见对应的机器码以及汇编指令，可以单步执行这些指令
+
+## 添加/修改指令
+通过调试qemu可以找到指令译码的函数
+
+1. 启用调试（这里用的是系统自带的gdb，用来调试qemu程序本身）
+    `gdb --args ./qemu-system-arm -machine vexpress-a9 -m 256M -serial stdio -kernel test.elf -S -s`
+1. 设置断点，通过代码分析，已经知道arm译码函数是disas_arm_insn，因此执行
+    `break disas_arm_insn`
+1. `run`开始程序执行（模拟器界面弹出后默认是暂停状态，需要通过菜单结束暂停）
+1. 程序执行后会触发断点，变量insn中存储的就是当前译码的执行，通过单步执行(`n`)可以找到具体译码该执行的代码，到对应qemu源代码中找到后进行修改测试（比如，bic  r0, #0x1f指令中而可以通过代码修改使之永远载入一个固定的常数）
+1. 重新编译qemu
+    ```
+    ../configure --target-list=arm-softmmu --enable-debug --enable-debug-info
+    make
+    ```
+1. 使用交叉编译版gdb调试test.elf，通过查看寄存器可以得知修改结果正确
+1. 我只测试修改了一条指令，如果需要添加新指令，修改位置是相同的，根据tcg提供的函数来自行组织执行的执行内容
+
+## 交叉编译gdb
+参考https://www.cnblogs.com/lijinlei/p/4850432.html
+
+1. 下载gdb，可以从官网下
+1. configure 
+    `./configure --target=arm-none-linux-gnueabi --program-prefix=arm-none-linux-gnueabi-  --prefix=/home/enzo --with-python`
+    其中：
+    --target i指明目标系统类型
+    --prefix 指生成的可执行文件安装在哪个目录
+    --program-prefix  指生成的可执行文件的前缀
+1. make 会提示错误缺少bfd.h
+   安装 `sudo apt-get install binutils-dev` 后解决问题
+1. make install
+1. 这样安装完成后没有安装到系统目录，以后运行时需要拷贝到对应文件夹，使用./方式运行
+1. 用gdb 查看汇编代码， 采用disassemble 和 x 命令。
+1. nexti, stepi 可以单步指令执行,layout src 查看源码，print查看变量值
+1. 其他参考资料：
+    https://blog.csdn.net/hejinjing_tom_com/article/details/26704487
+
+    qemu+arm-linux-gdb模拟运行ARM程序 http://emb.hqyj.com/Column/3657.html
+
+    Linux下交叉编译gdb，gdbserver+gdb的使用以及通过gdb调试core文件 https://www.cnblogs.com/lidabo/p/5645653.html
+
+
+
 # 其他
 1. {/target/xxx/translate.c}: guest ISA speciﬁc code. 
 3. {tcg-*/*/}: host ISA speciﬁc code.
@@ -783,3 +927,11 @@ tcg使用方法
 7. hw/*: Hardware, including video, audio, and boards.
 
 https://people.cs.nctu.edu.tw/~chenwj/dokuwiki/doku.php?id=qemu
+
+# openrisc qemu编译运行
+./configure --target-list='or1k-softmmu or1k-linux-user' && make
+
+https://wiki.qemu.org/Documentation/Platforms/OpenRISC
+
+运行linux镜像
+./qemu-system-or1k -cpu or1200 -M or1k-sim -kernel or1k-linux-4.10 -serial stdio -nographic -monitor none
