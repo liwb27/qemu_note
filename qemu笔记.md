@@ -935,3 +935,117 @@ https://wiki.qemu.org/Documentation/Platforms/OpenRISC
 
 运行linux镜像
 ./qemu-system-or1k -cpu or1200 -M or1k-sim -kernel or1k-linux-4.10 -serial stdio -nographic -monitor none
+
+# qemu monitor
+在启动 QEMU 的时候，同时也会启动 monitor 的控制台，通过这个控制台，可以与 QEMU 或者运行状态的虚拟机进行交互。虽然现在有诸如 virt-manager 之类的图形界面的虚拟机管理工具，但是在 monitor 的控制台窗口输入命令似乎更符合 Linux 程序员的开发习惯，而且还能完成一些图形化管理工具所不具备的功能。在 monitor 控制台中，可以完成很多常规操作，比如添加删除设备、虚拟机音视频截取、获取虚拟机运行状态、更改虚拟机运行时配置等等。
+
+事实上，启动 QEMU 后通常是看不到 monitor 界面的。要进入该界面，可以在 QEMU 窗口激活的时候按住 Ctrl+Alt+2 进入，切换回工作界面需要按 Ctrl+Alt+1。另外，还可以在 QEMU 启动的时候指定 -monitor 参数。比如 -monitor stdio 将允许使用标准输入作为 monitor 命令源。这种方式和常见的 Linux 交互式的用户程序无异，所以在做测试工作的时候，可以很方便的编写出对虚拟机监控的 shell 脚本程序。
+
+https://www.ibm.com/developerworks/cn/linux/l-cn-qemu-monitor/index.html
+
+
+# configure
+
+## default_target_list
+从/default-configs目录中获取default_target_list
+第1526~1540行
+
+```sh
+default_target_list=""
+
+mak_wilds=""
+
+if [ "$softmmu" = "yes" ]; then
+    mak_wilds="${mak_wilds} $source_path/default-configs/*-softmmu.mak"
+fi
+if [ "$linux_user" = "yes" ]; then
+    mak_wilds="${mak_wilds} $source_path/default-configs/*-linux-user.mak"
+fi
+if [ "$bsd_user" = "yes" ]; then
+    mak_wilds="${mak_wilds} $source_path/default-configs/*-bsd-user.mak"
+fi
+
+for config in $mak_wilds; do
+    default_target_list="${default_target_list} $(basename "$config" .mak)"
+done
+```
+
+## 为每个target创建目录
+当传入targetlist时，会检查每个target是否在default_target_list中
+之后为每个target创建目录
+
+```sh
+for target in $target_list; do # line 6879
+target_dir="$target"
+config_target_mak=$target_dir/config-target.mak
+target_name=$(echo $target | cut -d '-' -f 1)
+target_bigendian="no"
+
+...
+
+
+done # line7329
+```
+
+## ${} 用法
+${file-my.file.txt} 若$file为unset，则使用my.file.txt作传回值
+${file:-my.file.txt} 若$file为unset或为null，则使用my.file.txt作传回值
+${file+my.file.txt} 若$file为空或非空值，则使用my.file.txt作传回值，unset时不处理
+${file:+my.file.txt} 若$file为非空值，则使用my.file.txt作传回值，unset或null时不处理
+
+
+## 新建target
+1. /default-configs目录下新建（复制）targetname-softmmu.mak文件
+1. 新建（复制）target详细代码，放在/target/{target_name}中，以及/hw/{target_name}中
+1. 新建（修改）/target/{target_name},/hw/{target_name}中的makefile.objs
+1. arch_init.h{/include/sysemu}, 增加枚举类型`QEMU_ARCH_RISCV = (1 << 19)`
+1. arch_init.c文件中增加新target定义 `#elif defined(TARGET_OPENRISC) #define QEMU_ARCH QEMU_ARCH_OPENRISC`
+1. 修改configure文件，line6928 `case "$target_name" in ...`后添加新target判断
+
+# makefile
+## 语法
+- .PHONY:xxx, 表示xxx是一个伪文件，没有依赖项
+- =基本赋值；?=如果未赋值则赋予等号后的值；:=覆盖之前的值；+=添加后面的值，不覆盖
+- include 如包含的文件不存在会报错； -include 如果文件不存在不会报错，可以用sinclude代替
+- @cmd @后的命令不会输出信息
+- cmd1 && cmd2 && ... 当前一条命令执行成功时才会执行下一条
+- cmd1 || cmd2 || ... 直到有一条命令执行成功时停止
+
+## 结构分析
+1. configure后，会在build目录生成一个makefile的软链接指向src目录下的makefile, 并为每个target建立一个目录，目录下的makefile软链接到makefile.target
+1. config-host.mak: 在configure时生成，其中定义了target_dir等变量值，在line21被makefile引用
+1. 定义了CONFIG_SOFTMMU，CONFIG_USER_ONLY，值为y或空
+    ```makefile
+    CONFIG_SOFTMMU := $(if $(filter %-softmmu,$(TARGET_DIRS)),y)
+    CONFIG_USER_ONLY := $(if $(filter %-user,$(TARGET_DIRS)),y)
+    ```
+1. line439: 默认make执行内容 all: $(DOCS) $(TOOLS) $(HELPERS-y) recurse-all modules，
+1. line518: recurse-all: $(SUBDIR_RULES) $(ROMSUBDIR_RULES)
+    其中$(SUBDIR_RULES)的值为target名称类似subdir-xxx-softmmu的内容
+1. line480: subdir-% 匹配所有subdir-xxx的文件名，是recurse-all的依赖项，处理时调用每个子目录下的makefile，命令里的$*就是subdir-%中%的内容，类似xxx-softmmu，可以匹配configure时建立的各个target目录
+    ```makefile
+    subdir-%:
+	$(call quiet-command,$(MAKE) $(SUBDIR_MAKEFLAGS) -C $* V="$(V)" TARGET_DIR="$*/" all,)
+    ```
+1. makefile.target文件中引用了所有依赖的中间文件，并且引用了`include $(SRC_PATH)/rules.mak`，
+    ```makefile
+    # cpu emulator library
+    obj-y += exec.o
+    obj-y += accel/
+    obj-$(CONFIG_TCG) += tcg/tcg.o tcg/tcg-op.o tcg/tcg-op-vec.o tcg/tcg-op-gvec.o
+    obj-$(CONFIG_TCG) += tcg/tcg-common.o tcg/optimize.o
+    obj-$(CONFIG_TCG_INTERPRETER) += tcg/tci.o
+    obj-$(CONFIG_TCG_INTERPRETER) += disas/tci.o
+    obj-$(CONFIG_TCG) += fpu/softfloat.o
+    obj-y += target/$(TARGET_BASE_ARCH)/ #这一行是target内容，$(TARGET_BASE_ARCH)在config-target.mak中定义
+    obj-y += disas.o
+    obj-$(call notempty,$(TARGET_XML_FILES)) += gdbstub-xml.o
+
+    # Hardware support
+    ifeq ($(TARGET_NAME), sparc64)
+    obj-y += hw/sparc64/
+    else
+    obj-y += hw/$(TARGET_BASE_ARCH)/ #硬件内容
+    endif
+    ```
+1. rules.mak 其中定义了一个宏可以扫描所有引用的目录，并加载目录下的makefile.objs文件中的内容(line259,279)
